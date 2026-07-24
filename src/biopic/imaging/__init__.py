@@ -1,0 +1,1 @@
+"""Scientific image-processing package."""

@@ -1,0 +1,1 @@
+"""Figure-board rendering support."""

@@ -1,0 +1,10 @@
+BioPic LM
+Copyright (C) 2026 BioPic LM contributors
+
+BioPic LM is intended to be distributed under the GNU General Public License,
+version 3 or later.
+
+This repository uses GIMP and RawTherapee only as reference projects for
+image-editing behavior and user-interface conventions. No GIMP or RawTherapee
+source file, icon, brush, cursor, preset, or other asset has been copied into
+this repository.

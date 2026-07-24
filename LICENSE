@@ -1,0 +1,7 @@
+SPDX-License-Identifier: GPL-3.0-or-later
+
+BioPic is distributed under the GNU General Public License, version 3 or later.
+
+The full GPL license text should be included in COPYING in source
+distributions. If COPYING is absent in a downstream package, obtain the GPL-3.0
+text from https://www.gnu.org/licenses/gpl-3.0.txt.

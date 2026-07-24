@@ -1,0 +1,26 @@
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+pytest_tmp/
+test_artifacts/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.tmp_manual_tests/
+.tmp_manual_pytest_equiv/
+
+# Local build and packaged application outputs.
+# Keep these out of the source repository and upload release archives separately
+# through GitHub Releases.
+build/
+dist/
+*.spec~
+*.zip
+*.7z
+*.tar.gz
+*.whl
+
+# Local runtime/cache folders.
+.biopic_cache/
+.codex_tmp*/
+tmp*/
