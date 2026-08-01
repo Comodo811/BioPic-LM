@@ -42,7 +42,7 @@ from biopic.imaging.stacking import (
     gpu_backend_status,
 )
 from biopic.imaging.stacking.gpu_memory import plan_gpu_memory_from_shapes
-from biopic.imaging.stacking.private_methods import private_stacking_enabled
+from biopic.imaging.stacking.private_methods import private_method_available
 from biopic.models.image_asset import ImageAsset, ImageAssetKind
 from biopic.models.image_stack import ImageStack
 from biopic.models.project import Project
@@ -109,9 +109,9 @@ class StackWorkspace(QWidget):
         self.method_combo.addItem(
             "Pyramid Max Contrast", StackingMethod.PYRAMID_MAX_CONTRAST.value
         )
-        self._private_stacking_enabled = private_stacking_enabled()
-        if self._private_stacking_enabled:
+        if private_method_available("custom"):
             self.method_combo.addItem("Custom", StackingMethod.CUSTOM.value)
+        if private_method_available("custom2"):
             self.method_combo.addItem("Custom2", StackingMethod.CUSTOM2.value)
         self.metric_combo = QComboBox()
         for metric in FocusMetric:
