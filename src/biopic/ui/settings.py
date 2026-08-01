@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -82,10 +83,38 @@ def remembered_save_file(
     dialog.setOption(QFileDialog.Option.DontConfirmOverwrite, False)
     if suggested_name:
         dialog.selectFile(suggested_name)
-    filename = dialog.selectedFiles()[0] if dialog.exec() == QDialog.DialogCode.Accepted else ""
+    filename = ""
+    if dialog.exec() == QDialog.DialogCode.Accepted:
+        filename = _apply_selected_save_filter_suffix(
+            dialog.selectedFiles()[0],
+            dialog.selectedNameFilter(),
+        )
     if filename:
         settings.setValue(f"folders/{key}", str(Path(filename).parent))
     return filename
+
+
+def _apply_selected_save_filter_suffix(filename: str, selected_filter: str) -> str:
+    """Make a save-dialog path match the selected file-type filter."""
+    if not filename:
+        return filename
+    extensions = _extensions_from_name_filter(selected_filter)
+    if not extensions:
+        return filename
+    path = Path(filename)
+    suffix = path.suffix.lower()
+    normalized = {extension.lower() for extension in extensions}
+    if suffix in normalized:
+        return str(path)
+    return str(path.with_suffix(extensions[0]))
+
+
+def _extensions_from_name_filter(name_filter: str) -> list[str]:
+    """Extract extensions from a Qt name filter such as ``JPEG (*.jpg *.jpeg)``."""
+    return [
+        match.group(1).lower()
+        for match in re.finditer(r"\*([.][A-Za-z0-9]+)", name_filter)
+    ]
 
 
 def settings_json(key: str, default: Any) -> Any:

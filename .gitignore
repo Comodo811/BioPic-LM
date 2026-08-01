@@ -24,3 +24,8 @@ dist/
 .biopic_cache/
 .codex_tmp*/
 tmp*/
+
+# Private/local stacking methods. Keep proprietary or experimental stackers out
+# of source releases; load them only from a private branch or local install.
+src/biopic_private/
+private_plugins/

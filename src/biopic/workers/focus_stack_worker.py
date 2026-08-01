@@ -23,6 +23,7 @@ class FocusStackWorker(QThread):
     """Run focus stacking off the GUI thread."""
 
     progressChanged = Signal(str, float)
+    stackPreviewChanged = Signal(object, str)
     stackFinished = Signal(object)
     stackFailed = Signal(str)
 
@@ -47,7 +48,10 @@ class FocusStackWorker(QThread):
                 self.stackFailed.emit("Stacking cancelled.")
                 return
             result: FocusStackResult = focus_stack(
-                images, self.job.parameters, progress=self.progressChanged.emit
+                images,
+                self.job.parameters,
+                progress=self.progressChanged.emit,
+                preview=self.stackPreviewChanged.emit,
             )
         except Exception as exc:  # noqa: BLE001 - convert worker failures to UI signal
             self.stackFailed.emit(str(exc))

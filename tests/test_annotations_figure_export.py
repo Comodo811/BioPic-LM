@@ -576,6 +576,16 @@ def test_raster_export_image(workspace_tmp_path: Path) -> None:
     assert path.stat().st_size > 0
 
 
+def test_raster_export_image_writes_jpeg(workspace_tmp_path: Path) -> None:
+    image = np.full((5, 5, 3), 128, dtype=np.uint8)
+    path = workspace_tmp_path / "export.jpg"
+
+    export_image(image, path)
+
+    exported = Image.open(path)
+    assert exported.format == "JPEG"
+
+
 def test_figure_board_export_preserves_layout_gutters_labels_and_transforms(
     workspace_tmp_path: Path,
 ) -> None:

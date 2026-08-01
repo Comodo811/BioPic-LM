@@ -51,6 +51,10 @@ class StackFromVideoWorkspace(QWidget):
     stackCreated = Signal(str)
     videoLoaded = Signal()
 
+    def minimumSizeHint(self) -> QSize:
+        """Allow video controls/timeline to shrink with the main window."""
+        return QSize(320, 260)
+
     def __init__(self, project: Project) -> None:
         super().__init__()
         self.project = project

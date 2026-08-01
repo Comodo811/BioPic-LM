@@ -55,6 +55,36 @@ python -m pip install -e .[packaging,raw]
 python -m PyInstaller BioPicLM.spec --clean --noconfirm
 ```
 
+For a CUDA-enabled build, the build machine must have a compatible NVIDIA
+driver and CUDA runtime support. Install the optional CUDA extra before running
+PyInstaller:
+
+```powershell
+python -m pip install -e .[packaging,raw,cuda]
+python -c "from biopic.imaging.stacking import gpu_backend_status; print(gpu_backend_status())"
+python -m PyInstaller BioPicLM.spec --clean --noconfirm
+```
+
+The packaged app bundles the Python CUDA-array package from the build
+environment. Target machines still need a compatible NVIDIA driver. If CuPy or
+CUDA is unavailable, BioPic falls back to the CPU stacking path.
+
+Current CUDA coverage:
+
+- Depth Map uses a CuPy GPU-first path for focus scoring, smoothing, depth
+  selection, confidence, blending and final cleanup.
+- Depth Map can fall back to overlapping tiled GPU processing when the full
+  stack does not fit in the configured VRAM budget. BioPic defaults to a
+  conservative 4 GB budget for microscopy-camera stacks.
+- Pyramid Max Contrast uses a CuPy GPU-first path for pyramid construction,
+  contrast maps, winner selection, depth voting and reconstruction.
+- Pyramid Max Contrast also has tiled GPU processing for stacks that exceed the
+  configured VRAM budget.
+- Alignment can use OpenCV CUDA for the full-resolution affine warp when a CUDA
+  OpenCV build is present. Transform estimation remains CPU-based.
+- Custom stacking has partial CUDA/OpenCV acceleration for focus scoring and
+  filtering, but the decompiled-style multi-buffer update logic remains CPU.
+
 The packaged app is created under:
 
 ```text

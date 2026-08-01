@@ -6,7 +6,7 @@ from PySide6.QtCore import QRectF, QSize, Qt
 from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import QGridLayout, QLabel, QScrollArea, QVBoxLayout, QWidget
 
-from biopic.models.image_asset import ImageAsset
+from biopic.models.image_asset import ImageAsset, ImageAssetKind
 from biopic.models.image_stack import ImageStack
 from biopic.models.project import Project
 from biopic.resources import resource_path
@@ -72,7 +72,8 @@ class OverviewWorkspace(QWidget):
             [
                 asset
                 for asset in self.project.assets.values()
-                if asset.id not in stacked_asset_ids
+                if asset.kind is not ImageAssetKind.STACK_SOURCE
+                and asset.id not in stacked_asset_ids
             ],
         )
         self._add_stack_category(

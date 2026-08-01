@@ -14,7 +14,10 @@ class FocusMetric(StrEnum):
     LAPLACIAN = "laplacian"
     MODIFIED_LAPLACIAN = "modified_laplacian"
     TENEGRAD = "tenengrad"
+    SCHARR = "scharr"
+    BRENNER = "brenner"
     LOCAL_VARIANCE = "local_variance"
+    WAVELET = "wavelet"
 
 
 def focus_measure(image: np.ndarray, metric: FocusMetric, radius: int) -> np.ndarray:
@@ -28,11 +31,17 @@ def focus_measure(image: np.ndarray, metric: FocusMetric, radius: int) -> np.nda
         sx = ndimage.sobel(gray, axis=1, mode="reflect")
         sy = ndimage.sobel(gray, axis=0, mode="reflect")
         score = sx * sx + sy * sy
+    elif metric is FocusMetric.SCHARR:
+        score = _scharr_energy(gray)
+    elif metric is FocusMetric.BRENNER:
+        score = _brenner_gradient(gray, offset=max(1, radius))
     elif metric is FocusMetric.LOCAL_VARIANCE:
         score = _local_variance(gray, radius)
+    elif metric is FocusMetric.WAVELET:
+        score = _wavelet_energy(gray)
     else:
         raise ValueError(f"Unsupported focus metric: {metric}")
-    if radius > 0 and metric is not FocusMetric.LOCAL_VARIANCE:
+    if radius > 0 and metric not in {FocusMetric.LOCAL_VARIANCE, FocusMetric.BRENNER}:
         size = radius * 2 + 1
         score = ndimage.uniform_filter(score, size=size, mode="reflect")
     return np.asarray(score, dtype=np.float32)
@@ -64,3 +73,30 @@ def _local_variance(gray: np.ndarray, radius: int) -> np.ndarray:
     mean = ndimage.uniform_filter(gray, size=size, mode="reflect")
     mean_sq = ndimage.uniform_filter(gray * gray, size=size, mode="reflect")
     return np.maximum(mean_sq - mean * mean, 0.0)
+
+
+def _scharr_energy(gray: np.ndarray) -> np.ndarray:
+    kernel_x = np.array([[3, 0, -3], [10, 0, -10], [3, 0, -3]], dtype=np.float32)
+    kernel_y = kernel_x.T
+    sx = ndimage.convolve(gray, kernel_x, mode="reflect")
+    sy = ndimage.convolve(gray, kernel_y, mode="reflect")
+    return sx * sx + sy * sy
+
+
+def _brenner_gradient(gray: np.ndarray, offset: int = 2) -> np.ndarray:
+    offset = max(1, int(offset))
+    score = np.zeros_like(gray, dtype=np.float32)
+    dx = gray[:, offset:] - gray[:, :-offset]
+    dy = gray[offset:, :] - gray[:-offset, :]
+    score[:, :-offset] += dx * dx
+    score[:-offset, :] += dy * dy
+    return score
+
+
+def _wavelet_energy(gray: np.ndarray) -> np.ndarray:
+    horizontal = gray[:, 1::2] - gray[:, ::2][:, : gray[:, 1::2].shape[1]]
+    vertical = gray[1::2, :] - gray[::2, :][: gray[1::2, :].shape[0], :]
+    energy = np.zeros_like(gray, dtype=np.float32)
+    energy[:, : horizontal.shape[1]] += horizontal * horizontal
+    energy[: vertical.shape[0], :] += vertical * vertical
+    return ndimage.uniform_filter(energy, size=3, mode="reflect")

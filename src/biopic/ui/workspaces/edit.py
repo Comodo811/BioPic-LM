@@ -123,6 +123,10 @@ class EditWorkspace(
 ):
     """GIMP-like non-destructive image-editing workspace."""
 
+    def minimumSizeHint(self) -> QSize:
+        """Allow the main window to shrink below the editor's preferred layout width."""
+        return QSize(320, 220)
+
     def __init__(self, project: Project) -> None:
         super().__init__()
         self.project = project

@@ -8,7 +8,7 @@ from contextlib import suppress
 from pathlib import Path
 from time import perf_counter
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,6 +28,7 @@ from biopic.app.branding import APP_NAME, APP_VERSION, WINDOW_TITLE_PREFIX
 from biopic.export import export_image, export_project_figure_board
 from biopic.imaging.io import SUPPORTED_EXTENSIONS, import_images, import_stack
 from biopic.imaging.project_render import render_project_image
+from biopic.models.image_asset import ImageAssetKind
 from biopic.models.image_stack import StackKind
 from biopic.models.project import Project
 from biopic.persistence.project_store import ProjectStore
@@ -35,7 +36,9 @@ from biopic.ui.app_icon import biopic_app_icon
 from biopic.ui.main_window_chrome import MAIN_WINDOW_STYLESHEET, WorkspaceWatermark
 from biopic.ui.main_window_presets import MainWindowPresetsMixin
 from biopic.ui.settings import remembered_open_file, remembered_open_files, remembered_save_file
+from biopic.ui.stack_import_resolution import resolve_stack_import_paths
 from biopic.ui.theme import apply_theme, current_theme, set_current_theme
+from biopic.ui.workspace_helpers.common import stack_display_name
 from biopic.ui.workspaces import (
     AnnotationWorkspace,
     EditWorkspace,
@@ -51,6 +54,19 @@ from biopic.ui.workspaces import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+class WorkspaceStack(QStackedWidget):
+    """Stacked workspaces without inactive pages forcing the main-window minimum."""
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(1, 1)
+
+    def sizeHint(self) -> QSize:
+        current = self.currentWidget()
+        if current is not None:
+            return current.sizeHint()
+        return super().sizeHint()
 
 
 class MainWindow(MainWindowPresetsMixin, QMainWindow):
@@ -73,7 +89,7 @@ class MainWindow(MainWindowPresetsMixin, QMainWindow):
         if not icon.isNull():
             self.setWindowIcon(icon)
         self.setWindowTitle(f"{WINDOW_TITLE_PREFIX} - {project.name}")
-        self._workspace = QStackedWidget()
+        self._workspace = WorkspaceStack()
         self._workspace_names = [
             "Overview",
             "Stack from Video",
@@ -313,6 +329,12 @@ class MainWindow(MainWindowPresetsMixin, QMainWindow):
             )
             self.context_toolbar.addAction(
                 self._toolbar_action("Save Result As", self.save_stacked_image)
+            )
+            self.context_toolbar.addAction(
+                self._toolbar_action(
+                    "Sharpness Comparison",
+                    self.stack_workspace.open_sharpness_comparison,
+                )
             )
         elif index == 3:
             self.context_toolbar.addAction(
@@ -559,6 +581,9 @@ class MainWindow(MainWindowPresetsMixin, QMainWindow):
         paths = self._select_image_paths("Import Image Stack")
         if not paths:
             return
+        paths = resolve_stack_import_paths(self, paths)
+        if not paths:
+            return
         try:
             stack = import_stack(self.project, paths, StackKind.FOCAL)
         except (OSError, ValueError) as exc:
@@ -572,15 +597,25 @@ class MainWindow(MainWindowPresetsMixin, QMainWindow):
     def refresh_project_views(self) -> None:
         """Refresh all views that mirror project state."""
         start = perf_counter()
+        self._remove_empty_stacks()
         dirty_marker = "*" if self._has_unsaved_changes else ""
         self.setWindowTitle(f"{WINDOW_TITLE_PREFIX} - {self.project.name}{dirty_marker}")
         self.project_list.clear()
-        self.project_list.addItem(f"Sources ({len(self.project.assets)})")
-        for asset in self.project.assets.values():
+        stacked_asset_ids = {
+            asset_id for stack in self.project.stacks.values() for asset_id in stack.asset_ids
+        }
+        source_assets = [
+            asset
+            for asset in self.project.assets.values()
+            if asset.kind is not ImageAssetKind.STACK_SOURCE
+            and asset.id not in stacked_asset_ids
+        ]
+        self.project_list.addItem(f"Sources ({len(source_assets)})")
+        for asset in source_assets:
             self.project_list.addItem(f"  {asset.filename}")
         self.project_list.addItem(f"Stacks ({len(self.project.stacks)})")
         for stack in self.project.stacks.values():
-            self.project_list.addItem(f"  {stack.name}: {len(stack.asset_ids)} frames")
+            self.project_list.addItem(f"  {stack_display_name(stack, self.project.assets)}")
         self.project_list.addItem(f"Pipeline nodes ({len(self.project.graph.nodes)})")
         self.project_list.addItem(f"Measurements ({len(self.project.measurements)})")
         self.project_list.addItem(f"Scale bars ({len(self.project.scale_bars)})")
@@ -618,6 +653,30 @@ class MainWindow(MainWindowPresetsMixin, QMainWindow):
             type(active_widget).__name__ if active_widget is not None else None,
         )
         self._update_empty_watermark()
+
+    def _remove_empty_stacks(self) -> None:
+        """Remove empty stack records and their derived stack-result assets."""
+        empty_stack_ids = {
+            stack_id
+            for stack_id, stack in self.project.stacks.items()
+            if not stack.asset_ids
+        }
+        if not empty_stack_ids:
+            return
+        for stack_id in empty_stack_ids:
+            self.project.stacks.pop(stack_id, None)
+        stale_result_ids = [
+            asset.id
+            for asset in self.project.assets.values()
+            if (
+                asset.kind is ImageAssetKind.STACK_RESULT
+                and asset.metadata.get("source_stack_id") in empty_stack_ids
+            )
+        ]
+        for asset_id in stale_result_ids:
+            self.project.assets.pop(asset_id, None)
+        self.project.touch()
+        self._has_unsaved_changes = True
 
     def save_stacked_image(self) -> None:
         """Save the current focus-stack result."""
@@ -816,6 +875,7 @@ class MainWindow(MainWindowPresetsMixin, QMainWindow):
         if not self._has_unsaved_changes:
             return True
         dialog = QMessageBox(self)
+        dialog.setPalette(self.palette())
         dialog.setIcon(QMessageBox.Icon.Warning)
         dialog.setWindowTitle("Unsaved Project")
         dialog.setText(

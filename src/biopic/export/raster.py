@@ -26,6 +26,8 @@ def export_image(image: np.ndarray, path: Path, *, dpi: int = 300) -> None:
         tifffile.imwrite(path, image, resolution=(dpi, dpi))
         return
     pil = Image.fromarray(_display_compatible(image))
+    if suffix in {".jpg", ".jpeg"} and pil.mode in {"RGBA", "LA", "P"}:
+        pil = pil.convert("RGB")
     pil.save(path, dpi=(dpi, dpi))
 
 

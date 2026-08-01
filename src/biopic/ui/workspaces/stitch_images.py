@@ -57,6 +57,10 @@ class StitchImagesWorkspace(QWidget):
 
     stitchCreated = Signal(list)
 
+    def minimumSizeHint(self) -> QSize:
+        """Allow splitter panes to collapse instead of forcing the main window wide."""
+        return QSize(320, 220)
+
     def __init__(self, project: Project) -> None:
         super().__init__()
         self.project = project
@@ -113,7 +117,9 @@ class StitchImagesWorkspace(QWidget):
         self.selected_list.setUniformItemSizes(True)
         self.selected_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         middle_layout.addWidget(self.selected_list)
-        self.empty_label = QLabel("Drag at least two standalone images here, then click Stitch Images.")
+        self.empty_label = QLabel(
+            "Drag at least two standalone images here, then click Stitch Images."
+        )
         self.empty_label.setWordWrap(True)
         middle_layout.addWidget(self.empty_label)
         self.canvas = ImageCanvas()
@@ -135,7 +141,9 @@ class StitchImagesWorkspace(QWidget):
         self.redo_button.clicked.connect(self.redo)
         self.stitch_button.clicked.connect(self.stitch_images)
         self.cancel_button.clicked.connect(self.cancel_stitching)
-        self.available_list.itemDoubleClicked.connect(lambda _item: self.add_selected_available_images())
+        self.available_list.itemDoubleClicked.connect(
+            lambda _item: self.add_selected_available_images()
+        )
         self.selected_list.model().rowsMoved.connect(self._selected_rows_moved)
 
     def refresh(self) -> None:
@@ -222,7 +230,11 @@ class StitchImagesWorkspace(QWidget):
         self._refresh_selected_list()
 
     def stitch_images(self) -> None:
-        assets = [self.project.assets[asset_id] for asset_id in self._selected_asset_ids if asset_id in self.project.assets]
+        assets = [
+            self.project.assets[asset_id]
+            for asset_id in self._selected_asset_ids
+            if asset_id in self.project.assets
+        ]
         if len(assets) < 2:
             QMessageBox.warning(self, "Stitch Images", "Select at least two images to stitch.")
             return
@@ -241,7 +253,10 @@ class StitchImagesWorkspace(QWidget):
             self._worker.cancel()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasFormat("application/x-biopic-asset-id") or event.mimeData().hasUrls():
+        if (
+            event.mimeData().hasFormat("application/x-biopic-asset-id")
+            or event.mimeData().hasUrls()
+        ):
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent) -> None:
@@ -275,7 +290,8 @@ class StitchImagesWorkspace(QWidget):
             return
         output_dir = (Path.cwd() / ".biopic_cache" / self.project.id / "stitched").resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
-        path = output_dir / f"stitched_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}.png"
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        path = output_dir / f"stitched_{timestamp}_{uuid4().hex[:8]}.png"
         try:
             export_image(result.pixels, path)
             read_result = read_image_asset(path, load_pixels=False)
@@ -321,7 +337,11 @@ class StitchImagesWorkspace(QWidget):
             self._update_buttons()
 
     def _standalone_assets(self) -> list[ImageAsset]:
-        stacked_ids = {asset_id for stack in self.project.stacks.values() for asset_id in stack.asset_ids}
+        stacked_ids = {
+            asset_id
+            for stack in self.project.stacks.values()
+            for asset_id in stack.asset_ids
+        }
         return [
             asset
             for asset in self.project.assets.values()

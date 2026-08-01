@@ -35,6 +35,9 @@ raw = [
 packaging = [
   "pyinstaller>=6.8",
 ]
+cuda = [
+  "cupy-cuda12x[ctk]>=14.0",
+]
 
 [project.scripts]
 biopic-lm = "biopic.app.main:main"

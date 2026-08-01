@@ -9,6 +9,11 @@ from biopic.imaging.io import SUPPORTED_EXTENSIONS, import_images, import_stack,
 from biopic.models.image_stack import StackKind
 from biopic.models.project import Project
 from biopic.persistence.project_store import ProjectStore
+from biopic.ui.stack_import_resolution import (
+    duplicate_basename_extension_groups,
+    filter_duplicate_basename_extensions,
+    prioritized_extensions,
+)
 
 
 def test_png_import_reads_dimensions_and_dtype(workspace_tmp_path: Path) -> None:
@@ -94,6 +99,29 @@ def test_import_stack_preserves_order_and_round_trips(workspace_tmp_path: Path) 
         "z_0.png",
         "z_1.png",
         "z_2.png",
+    ]
+
+
+def test_stack_import_duplicate_file_types_can_prioritize_raw(
+    workspace_tmp_path: Path,
+) -> None:
+    paths = [
+        workspace_tmp_path / "sample_001.CR2",
+        workspace_tmp_path / "sample_001.JPG",
+        workspace_tmp_path / "sample_002.CR2",
+        workspace_tmp_path / "sample_002.JPG",
+        workspace_tmp_path / "sample_003.CR2",
+    ]
+
+    conflicts = duplicate_basename_extension_groups(paths)
+    filtered = filter_duplicate_basename_extensions(paths, preferred_extension=".cr2")
+
+    assert set(conflicts) == {"sample_001", "sample_002"}
+    assert prioritized_extensions(paths)[0] == ".cr2"
+    assert [path.name for path in filtered] == [
+        "sample_001.CR2",
+        "sample_002.CR2",
+        "sample_003.CR2",
     ]
 
 

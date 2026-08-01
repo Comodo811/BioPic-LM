@@ -95,7 +95,7 @@ class FigureBoardPreview(FigureBoardPreviewGeometryMixin, QWidget):
         self._interaction_quality_timer.setSingleShot(True)
         self._interaction_quality_timer.setInterval(140)
         self._interaction_quality_timer.timeout.connect(self._finish_interaction_quality)
-        self.setMinimumSize(QSize(360, 280))
+        self.setMinimumSize(QSize(1, 1))
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAcceptDrops(True)
         self.setAutoFillBackground(False)
@@ -120,6 +120,14 @@ class FigureBoardPreview(FigureBoardPreviewGeometryMixin, QWidget):
         self._panel_cache_generation += 1
         self._panel_pixmap_cache.clear()
         self.update()
+
+    def sizeHint(self) -> QSize:
+        """Prefer the current page preview size without forcing the window minimum."""
+        return self._canvas_size if self._canvas_size.isValid() else QSize(360, 280)
+
+    def minimumSizeHint(self) -> QSize:
+        """Allow the main window to shrink; clipped previews remain interactive."""
+        return QSize(1, 1)
 
     def set_zoom_percent(self, percent: int) -> None:
         """Set board zoom where 100% equals page output pixels."""
@@ -1021,7 +1029,7 @@ class FigureBoardPreview(FigureBoardPreviewGeometryMixin, QWidget):
             size = QSize(360, 280)
             if force or size != self._canvas_size:
                 self._canvas_size = size
-                self.setMinimumSize(size)
+                self.updateGeometry()
             return
         width_mm = self._page_width_mm(self._board.page)
         height_mm = self._page_height_mm(self._board.page)
@@ -1036,5 +1044,4 @@ class FigureBoardPreview(FigureBoardPreviewGeometryMixin, QWidget):
         )
         if force or size != self._canvas_size:
             self._canvas_size = size
-            self.setMinimumSize(size)
-            self.resize(size)
+            self.updateGeometry()

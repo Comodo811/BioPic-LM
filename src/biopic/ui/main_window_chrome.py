@@ -13,6 +13,16 @@ QMainWindow, QMenuBar, QMenu, QToolBar, QStatusBar, QDockWidget {
     background: palette(window);
     color: palette(window-text);
 }
+QDialog,
+QMessageBox {
+    background: palette(window);
+    color: palette(window-text);
+}
+QMessageBox QLabel,
+QDialog QLabel {
+    color: palette(window-text);
+    background: transparent;
+}
 QMenuBar::item:selected, QMenu::item:selected {
     background: palette(mid);
 }
