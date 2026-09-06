@@ -83,6 +83,51 @@ def layout_ascii_preview(preset: LayoutPreset) -> str:
     return "\n".join("".join(row).rstrip() for row in cells)
 
 
+def layout_pixmap_preview(preset: LayoutPreset, size: QSize = QSize(112, 76)) -> QPixmap:
+    """Return a compact visual preview for a normalized figure-board layout."""
+    canvas = QPixmap(size)
+    canvas.fill(QColor("transparent"))
+    painter = QPainter(canvas)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    page_margin = 6
+    page = QRect(
+        page_margin,
+        page_margin,
+        max(1, size.width() - page_margin * 2),
+        max(1, size.height() - page_margin * 2),
+    )
+    painter.setPen(QPen(QColor("#7a7a7a"), 1))
+    painter.setBrush(QColor("#f7f7f7"))
+    painter.drawRect(page)
+    palette = [
+        QColor("#d8e8ff"),
+        QColor("#e2f4df"),
+        QColor("#fff0c7"),
+        QColor("#f4dcf3"),
+        QColor("#dff1f4"),
+        QColor("#f2e5d7"),
+        QColor("#e7e0ff"),
+        QColor("#f7dddd"),
+    ]
+    for index, rect in enumerate(preset.panels):
+        x, y, panel_width, panel_height = rect
+        left = page.left() + x * page.width()
+        top = page.top() + y * page.height()
+        width = panel_width * page.width()
+        height = panel_height * page.height()
+        panel_rect = QRect(
+            int(round(left)) + 1,
+            int(round(top)) + 1,
+            max(2, int(round(width)) - 2),
+            max(2, int(round(height)) - 2),
+        )
+        painter.setBrush(palette[index % len(palette)])
+        painter.setPen(QPen(QColor("#4c566a"), 1))
+        painter.drawRect(panel_rect)
+    painter.end()
+    return canvas
+
+
 def page_dimension_mm(value: float, unit: PageUnit) -> float:
     if unit is PageUnit.MM:
         return value

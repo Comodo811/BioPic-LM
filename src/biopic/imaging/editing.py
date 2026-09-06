@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -18,22 +19,25 @@ from biopic.imaging.corrections import (
     white_balance_rendered,
 )
 from biopic.imaging.corrections.geometry import resize_uniform
+from biopic.imaging.background import (
+    fill_transparent_regions_with_background,
+    global_textured_background_from_selection,
+    healed_textured_background_from_selection,
+)
 from biopic.imaging.dtype import restore_dtype, to_float
 from biopic.imaging.filters import (
     deconvolve_richardson_lucy,
     gaussian_smooth,
+    gimp_noise_reduction,
     high_pass,
     local_contrast,
     median_filter,
-    microscopy_noise_reduction,
-    non_local_means,
     total_variation_denoise,
     wavelet_sharpen,
 )
 from biopic.native.hue_saturation_backend import apply_hue_saturation as native_hue_saturation
-from biopic.native.adjustments_backend import (
-    uniform_background_outside_selection as native_uniform_background,
-)
+
+ProgressCallback = Callable[[str, float], None]
 
 
 def apply_edit_operation(
@@ -60,6 +64,7 @@ def apply_edit_operation(
             image,
             [(float(x), float(y)) for x, y in points],
             channel=str(parameters.get("channel", "rgb")),
+            curve_type=str(parameters.get("curve_type", "smooth")),
         )
     if operation == "white_balance":
         return white_balance_rendered(
@@ -70,6 +75,14 @@ def apply_edit_operation(
             blue=float(parameters.get("blue", 1.0)),
             temperature=float(parameters.get("temperature", 6500.0)),
             tint=float(parameters.get("tint", 1.0)),
+            preset=str(parameters.get("preset", "daylight")),
+            blue_red_equalizer=float(parameters.get("blue_red_equalizer", 1.0)),
+            awb_temperature_bias=float(parameters.get("awb_temperature_bias", 0.0)),
+            histogram_low_clip=float(parameters.get("histogram_low_clip", 0.2)),
+            histogram_high_clip=float(parameters.get("histogram_high_clip", 0.2)),
+            histogram_bins=int(parameters.get("histogram_bins", 32)),
+            raw_metadata=_coerce_raw_metadata(parameters.get("raw_metadata")),
+            camera_matrix_strength=float(parameters.get("camera_matrix_strength", 0.0)),
             normalize=bool(parameters.get("normalize", True)),
             sample_rect=_coerce_sample_rect(parameters.get("sample_rect")),
             sample_size=int(parameters.get("sample_size", 16)),
@@ -114,20 +127,7 @@ def apply_edit_operation(
             amount=float(parameters.get("amount", 1.0)),
         )
     if operation == "denoise":
-        method = str(parameters.get("method", "nl_means"))
-        if method == "microscopy":
-            return microscopy_noise_reduction(
-                image,
-                luminance_strength=float(parameters.get("luminance_strength", 0.08)),
-                chroma_strength=float(parameters.get("chroma_strength", 0.04)),
-                impulse_radius=int(parameters.get("impulse_radius", 1)),
-                preserve_edges=bool(parameters.get("preserve_edges", True)),
-            )
-        return non_local_means(
-            image,
-            patch_size=int(parameters.get("patch_size", 5)),
-            h=float(parameters.get("h", 0.08)),
-        )
+        return gimp_noise_reduction(image, strength=int(parameters.get("strength", 4)))
     if operation == "total_variation":
         return total_variation_denoise(image, weight=float(parameters.get("weight", 0.08)))
     if operation == "wavelet_sharpen":
@@ -159,6 +159,12 @@ def apply_edit_operation(
         )
     if operation == "rotate_90":
         return np.rot90(image, k=int(parameters.get("turns", 1)))
+    if operation == "rotate_free":
+        return rotate_free(image, angle=float(parameters.get("angle", 0.0)))
+    if operation == "crop_rotated_image":
+        return crop_rotated_image(image)
+    if operation == "fill_rotated_background":
+        return fill_rotated_background(image)
     if operation == "scale_uniform":
         return resize_uniform(image, scale=float(parameters.get("scale", 1.0)))
     if operation == "flip_horizontal":
@@ -198,6 +204,11 @@ def apply_edit_operation(
             image,
             selection_mask=parameters.get("selection_mask"),
         )
+    if operation == "healed_uniform_background_outside_selection":
+        return healed_uniform_background_outside_selection(
+            image,
+            selection_mask=parameters.get("selection_mask"),
+        )
     raise ValueError(f"Unsupported edit operation: {operation}")
 
 
@@ -229,19 +240,145 @@ def unsharp_mask(image: np.ndarray, sigma: float = 1.0, amount: float = 1.0) -> 
     return restore_dtype(np.clip(data + (data - blurred) * amount, 0.0, 1.0), dtype)
 
 
+def rotate_free(image: np.ndarray, angle: float = 0.0) -> np.ndarray:
+    """Rotate an image by an arbitrary angle and keep empty corners transparent."""
+    if abs(float(angle)) < 1e-6:
+        return np.asarray(image).copy()
+    rgba, dtype = _float_rgba(image)
+    rotated = ndimage.rotate(
+        rgba,
+        float(angle),
+        axes=(0, 1),
+        reshape=True,
+        order=1,
+        mode="constant",
+        cval=0.0,
+        prefilter=False,
+    )
+    rotated[..., :3] = np.clip(rotated[..., :3], 0.0, 1.0)
+    rotated[..., 3] = np.clip(rotated[..., 3], 0.0, 1.0)
+    return restore_dtype(rotated, dtype)
+
+
+def crop_rotated_image(image: np.ndarray) -> np.ndarray:
+    """Crop a transparent rotated image to the largest axis-aligned opaque rectangle."""
+    rect = rotated_content_crop_rect(image)
+    if rect is None:
+        return np.asarray(image).copy()
+    x, y, width, height = rect
+    return np.asarray(image)[y : y + height, x : x + width].copy()
+
+
+def fill_rotated_background(image: np.ndarray) -> np.ndarray:
+    """Fill transparent rotated-image corners with extrapolated edge background."""
+    data = np.asarray(image)
+    if data.ndim != 3 or data.shape[2] < 4:
+        return data.copy()
+    alpha = _normalized_alpha(data[..., 3])
+    if not np.any(alpha < (250.0 / 255.0)):
+        return data.copy()
+    return fill_transparent_regions_with_background(data)
+
+
+def rotated_content_crop_rect(image: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Return the largest opaque axis-aligned rectangle for a rotated transparent image."""
+    data = np.asarray(image)
+    if data.ndim != 3 or data.shape[2] < 4:
+        if data.ndim < 2:
+            return None
+        return (0, 0, int(data.shape[1]), int(data.shape[0]))
+    alpha = _normalized_alpha(data[..., 3])
+    mask = alpha > (250.0 / 255.0)
+    if not np.any(mask):
+        return None
+    if np.all(mask):
+        return (0, 0, int(mask.shape[1]), int(mask.shape[0]))
+    return _largest_true_rectangle(mask)
+
+
+def _float_rgba(image: np.ndarray) -> tuple[np.ndarray, np.dtype]:
+    data, dtype = to_float(image)
+    data = np.asarray(data, dtype=np.float32)
+    if data.ndim == 2:
+        rgb = np.repeat(data[..., None], 3, axis=2)
+        alpha = np.ones(data.shape, dtype=np.float32)
+    elif data.ndim == 3 and data.shape[2] >= 4:
+        rgb = data[..., :3]
+        alpha = data[..., 3]
+    elif data.ndim == 3 and data.shape[2] >= 3:
+        rgb = data[..., :3]
+        alpha = np.ones(data.shape[:2], dtype=np.float32)
+    elif data.ndim == 3 and data.shape[2] == 1:
+        rgb = np.repeat(data[..., :1], 3, axis=2)
+        alpha = np.ones(data.shape[:2], dtype=np.float32)
+    else:
+        raise ValueError("rotate_free expects a 2-D or channel-last image")
+    return np.dstack([rgb, alpha]).astype(np.float32, copy=False), dtype
+
+
+def _normalized_alpha(alpha: np.ndarray) -> np.ndarray:
+    alpha_array = np.asarray(alpha)
+    if np.issubdtype(alpha_array.dtype, np.floating):
+        if alpha_array.size and float(np.nanmax(alpha_array)) > 1.0:
+            return np.clip(alpha_array.astype(np.float32) / 255.0, 0.0, 1.0)
+        return np.clip(alpha_array.astype(np.float32), 0.0, 1.0)
+    info = np.iinfo(alpha_array.dtype)
+    return np.clip(alpha_array.astype(np.float32) / float(info.max), 0.0, 1.0)
+
+
+def _largest_true_rectangle(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    height, width = mask.shape
+    histogram = np.zeros(width, dtype=np.int32)
+    best_area = 0
+    best: tuple[int, int, int, int] | None = None
+    for y in range(height):
+        histogram = np.where(mask[y], histogram + 1, 0)
+        stack: list[tuple[int, int]] = []
+        for x in range(width + 1):
+            current_height = int(histogram[x]) if x < width else 0
+            start = x
+            while stack and stack[-1][1] > current_height:
+                previous_start, previous_height = stack.pop()
+                area = previous_height * (x - previous_start)
+                if area > best_area:
+                    best_area = area
+                    best = (
+                        previous_start,
+                        y - previous_height + 1,
+                        x - previous_start,
+                        previous_height,
+                    )
+                start = previous_start
+            if not stack or stack[-1] != (start, current_height):
+                stack.append((start, current_height))
+    return best
+
+
 def subtract_background_estimated(
-    image: np.ndarray, sigma: float = 24.0, amount: float = 1.0
+    image: np.ndarray,
+    sigma: float = 24.0,
+    amount: float = 1.0,
+    progress: ProgressCallback | None = None,
 ) -> np.ndarray:
     """Subtract a smooth estimated background field."""
+    _emit(progress, "Preparing background subtraction", 0.04)
     data, dtype = to_float(image)
     sigma = max(0.1, float(sigma))
     amount = max(0.0, float(amount))
-    sigma_spec: float | tuple[float, float, float] = sigma
-    if data.ndim == 3:
-        sigma_spec = (sigma, sigma, 0.0)
-    background = ndimage.gaussian_filter(data, sigma=sigma_spec, mode="reflect")
+    _emit(progress, "Estimating smooth background", 0.18)
+    background = _progressive_spatial_gaussian(
+        data,
+        sigma=sigma,
+        progress=progress,
+        progress_start=0.20,
+        progress_end=0.68,
+        message="Estimating smooth background",
+    )
+    _emit(progress, "Subtracting background field", 0.78)
     corrected = data - background * amount + np.median(background, axis=(0, 1))
-    return restore_dtype(np.clip(corrected, 0.0, 1.0), dtype)
+    result = restore_dtype(np.clip(corrected, 0.0, 1.0), dtype)
+    _emit(progress, "Background subtraction complete", 1.0)
+    return result
 
 
 def flat_field_correction_estimated(
@@ -249,43 +386,108 @@ def flat_field_correction_estimated(
     sigma: float = 24.0,
     strength: float = 1.0,
     preserve_mean: bool = True,
+    progress: ProgressCallback | None = None,
 ) -> np.ndarray:
     """Correct smooth multiplicative illumination using an estimated flat field."""
+    _emit(progress, "Preparing flat-field correction", 0.04)
     data, dtype = to_float(image)
     sigma = max(0.1, float(sigma))
     strength = max(0.0, min(1.0, float(strength)))
-    sigma_spec: float | tuple[float, float, float] = sigma
-    if data.ndim == 3:
-        sigma_spec = (sigma, sigma, 0.0)
-    flat = ndimage.gaussian_filter(data, sigma=sigma_spec, mode="reflect")
+    _emit(progress, "Estimating flat-field image", 0.16)
+    flat = _progressive_spatial_gaussian(
+        data,
+        sigma=sigma,
+        progress=progress,
+        progress_start=0.18,
+        progress_end=0.62,
+        message="Estimating flat-field image",
+    )
+    _emit(progress, "Normalizing flat-field image", 0.72)
     eps = max(1e-6, float(np.percentile(flat, 0.1)) * 0.05)
     axes = (0, 1) if data.ndim >= 2 else None
     flat_reference = np.median(flat, axis=axes) if preserve_mean and axes is not None else 1.0
+    _emit(progress, "Applying illumination correction", 0.84)
     corrected = data * flat_reference / np.maximum(flat, eps)
     blended = data * (1.0 - strength) + corrected * strength
-    return restore_dtype(np.clip(blended, 0.0, 1.0), dtype)
+    result = restore_dtype(np.clip(blended, 0.0, 1.0), dtype)
+    _emit(progress, "Flat-field correction complete", 1.0)
+    return result
+
+
+def _progressive_spatial_gaussian(
+    data: np.ndarray,
+    *,
+    sigma: float,
+    progress: ProgressCallback | None,
+    progress_start: float,
+    progress_end: float,
+    message: str,
+) -> np.ndarray:
+    if data.ndim != 3:
+        _emit(progress, message, progress_start)
+        result = ndimage.gaussian_filter(data, sigma=sigma, mode="reflect")
+        _emit(progress, message, progress_end)
+        return result
+    channels = []
+    total = max(1, data.shape[2])
+    for channel in range(data.shape[2]):
+        fraction = progress_start + (progress_end - progress_start) * (channel / total)
+        _emit(progress, f"{message} channel {channel + 1}/{total}", fraction)
+        channels.append(
+            ndimage.gaussian_filter(
+                data[..., channel],
+                sigma=sigma,
+                mode="reflect",
+            )
+        )
+    _emit(progress, message, progress_end)
+    return np.stack(channels, axis=-1)
+
+
+def _emit(progress: ProgressCallback | None, message: str, fraction: float) -> None:
+    if progress is not None:
+        progress(message, fraction)
 
 
 def uniform_background_outside_selection(
-    image: np.ndarray, selection_mask: object | None = None
+    image: np.ndarray,
+    selection_mask: object | None = None,
+    progress: ProgressCallback | None = None,
 ) -> np.ndarray:
-    """Replace pixels outside the selected organism with a robust background color."""
+    """Replace pixels outside the selected organism with cloned background texture."""
     data = np.asarray(image)
     mask = _coerce_selection_mask(selection_mask, data.shape[:2])
     if mask is None:
         mask = _central_ellipse_mask(data.shape[:2])
-    native = native_uniform_background(data, mask, 0)
-    if native is not None:
-        return native[0]
-    outside = ~mask
-    if not np.any(outside):
-        return data.copy()
-    bg_pixels = data[outside]
-    if bg_pixels.size == 0:
-        return data.copy()
-    color = np.median(bg_pixels.reshape(-1, *data.shape[2:]), axis=0)
     result = data.copy()
-    result[outside] = color.astype(data.dtype, copy=False)
+    outside = ~mask
+    result[outside] = global_textured_background_from_selection(
+        data,
+        mask,
+        0,
+        progress=progress,
+    )[outside]
+    return result
+
+
+def healed_uniform_background_outside_selection(
+    image: np.ndarray,
+    selection_mask: object | None = None,
+    progress: ProgressCallback | None = None,
+) -> np.ndarray:
+    """Replace pixels outside the selected organism with healed background texture."""
+    data = np.asarray(image)
+    mask = _coerce_selection_mask(selection_mask, data.shape[:2])
+    if mask is None:
+        mask = _central_ellipse_mask(data.shape[:2])
+    result = data.copy()
+    outside = ~mask
+    result[outside] = healed_textured_background_from_selection(
+        data,
+        mask,
+        0,
+        progress=progress,
+    )[outside]
     return result
 
 
@@ -606,6 +808,12 @@ def _coerce_sample_rect(value: object | None) -> tuple[int, int, int, int] | Non
     if not isinstance(value, (list, tuple)) or len(value) != 4:
         return None
     return tuple(int(part) for part in value)
+
+
+def _coerce_raw_metadata(value: object | None) -> dict[str, object] | None:
+    if isinstance(value, dict):
+        return dict(value)
+    return None
 
 
 def _central_ellipse_mask(shape: tuple[int, int]) -> np.ndarray:

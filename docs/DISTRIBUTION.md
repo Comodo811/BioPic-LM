@@ -83,7 +83,7 @@ Current CUDA coverage:
 - Alignment can use OpenCV CUDA for the full-resolution affine warp when a CUDA
   OpenCV build is present. Transform estimation remains CPU-based.
 - Custom stacking has partial CUDA/OpenCV acceleration for focus scoring and
-  filtering, but the decompiled-style multi-buffer update logic remains CPU.
+  filtering, but its multi-buffer update logic remains CPU.
 
 The packaged app is created under:
 

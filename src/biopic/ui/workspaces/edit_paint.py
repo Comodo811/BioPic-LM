@@ -35,9 +35,6 @@ from biopic.ui.workspace_helpers.paint import (
     dodge_burn_disk as _dodge_burn_disk,
 )
 from biopic.ui.workspace_helpers.paint import (
-    heal_disk as _heal_disk,
-)
-from biopic.ui.workspace_helpers.paint import (
     interpolated_points as _interpolated_points,
 )
 from biopic.ui.workspace_helpers.paint import (
@@ -55,9 +52,10 @@ from biopic.ui.workspace_helpers.paint import (
 from biopic.ui.workspaces.edit_constants import (
     TRANSFORM_TOOL_OPERATIONS as _TRANSFORM_TOOL_OPERATIONS,
 )
+from biopic.ui.workspaces.edit_paint_retouch import EditPaintRetouchMixin
 
 
-class EditPaintMixin:
+class EditPaintMixin(EditPaintRetouchMixin):
     def _tool_point_clicked(self, x: int, y: int) -> None:
         if self._should_queue_paint_point():
             self._enqueue_paint_point(float(x), float(y))
@@ -65,11 +63,12 @@ class EditPaintMixin:
         self._apply_tool_point_clicked(x, y)
 
     def _paint_point_moved(self, x: float, y: float) -> None:
+        if self._should_queue_paint_point():
+            self._update_queued_paint_tail_preview(x, y)
+            self._enqueue_paint_point(x, y)
+            return
         if self._should_vector_preview_paint_point():
             self._record_vector_preview_paint_point(x, y)
-            return
-        if self._should_queue_paint_point():
-            self._enqueue_paint_point(x, y)
             return
         self._apply_tool_point_clicked(int(round(x)), int(round(y)))
 
@@ -124,6 +123,24 @@ class EditPaintMixin:
         if not self._paint_flush_timer.isActive():
             self._paint_flush_timer.start()
 
+    def _update_queued_paint_tail_preview(self, x: float, y: float) -> None:
+        radius = max(1, int(round(self.primary_spin.value())))
+        paint_radius = 1 if self._selected_tool == "pencil" else radius
+        point = (x, y)
+        previous = self._last_tool_point
+        if previous is None:
+            points = [_rounded_point(point)]
+        elif self._selected_tool == "pencil":
+            points = _interpolated_points(previous, point, paint_radius)
+        else:
+            points = _interpolated_points(previous, point, max(1, paint_radius // 2))
+        self.canvas.clear_paint_preview()
+        self.canvas.extend_paint_preview(
+            points,
+            paint_radius,
+            self._stroke_preview_color(self._selected_tool),
+        )
+
     def _apply_tool_point_clicked(self, x: int, y: int) -> None:
         if self._current_pixels is None:
             return
@@ -163,7 +180,15 @@ class EditPaintMixin:
         self._apply_non_paint_tool_point(layer, x, y)
 
     def _apply_non_paint_tool_point(self, layer: EditLayer, x: int, y: int) -> None:
+        single_point_tile_paint = False
         clear_single_point_tile_paint = False
+        if (
+            self._selected_tool in {"clone", "heal"}
+            and self._paint_tile_session is None
+            and self._base_pixels is not None
+        ):
+            self._begin_tile_paint_session(layer)
+            single_point_tile_paint = self._paint_stroke_before is not None
         before = self._paint_stroke_before or self._snapshot_edit_state()
         if self._paint_tile_session is None:
             result = (
@@ -182,20 +207,83 @@ class EditPaintMixin:
             alpha = np.empty(self._paint_tile_session.base_pixels.shape[:2], dtype=np.float32)
         radius = max(1, int(round(self.primary_spin.value())))
         if self._selected_tool in {"clone", "heal"}:
-            _heal_disk(result, x, y, radius)
-            _paint_disk(alpha, x, y, radius, 1.0)
-            self._stage_paint_edit(
-                layer,
-                result,
-                alpha,
+            if self._clone_source_point is None:
+                self._status("Ctrl-click a source first.")
+                return
+            if self._clone_stroke_anchor is None:
+                self._clone_stroke_anchor = (x, y)
+            if self._paint_tile_session is not None:
+                source_content, source_alpha = self._clone_tile_source_buffers(layer)
+                source_offset = self._clone_source_offset()
+                points = self._linear_stroke_points((x, y), radius)
+                if self._selected_tool == "heal":
+                    dirty_rect = self._paint_tile_session.heal_content_and_alpha(
+                        points,
+                        radius,
+                        source_content,
+                        source_alpha,
+                        source_offset,
+                        selection_rect=self._selection_rect,
+                        selection_shape=self._selection_shape,
+                        selection_mask=self._selection_coverage_mask(),
+                    )
+                else:
+                    dirty_rect = self._paint_tile_session.clone_content_and_alpha(
+                        points,
+                        radius,
+                        source_content,
+                        source_alpha,
+                        source_offset,
+                        selection_rect=self._selection_rect,
+                        selection_shape=self._selection_shape,
+                        selection_mask=self._selection_coverage_mask(),
+                    )
+                self._stage_tile_paint_preview(layer, self._selected_tool, points, radius, dirty_rect)
+            else:
+                source_content, source_alpha = self._clone_source_buffers(result, alpha)
+                if self._selected_tool == "heal":
+                    self._heal_disk_from_source(
+                        result,
+                        alpha,
+                        source_content,
+                        source_alpha,
+                        x,
+                        y,
+                        radius,
+                    )
+                else:
+                    self._clone_disk_from_source(
+                        result,
+                        alpha,
+                        source_content,
+                        source_alpha,
+                        x,
+                        y,
+                        radius,
+                    )
+                self._stage_paint_edit(
+                    layer,
+                    result,
+                    alpha,
+                    self._selected_tool,
+                    dirty_rect=self._stroke_dirty_rect([(x, y)], radius),
+                    preview_points=[(x, y)],
+                    preview_radius=radius,
+                )
+            self._record_retouch_stroke(
                 self._selected_tool,
-                dirty_rect=self._stroke_dirty_rect([(x, y)], radius),
-                preview_points=[(x, y)],
-                preview_radius=radius,
+                x,
+                y,
+                radius,
+                {
+                    "source": self._clone_source_point,
+                    "anchor": self._clone_stroke_anchor,
+                },
             )
-            self._record_retouch_stroke(self._selected_tool, x, y, radius, {})
-            if self._paint_stroke_before is None:
+            if single_point_tile_paint or self._paint_stroke_before is None:
                 self._commit_staged_paint(layer, self._selected_tool, before)
+                self._commit_batched_retouch_stroke()
+                clear_single_point_tile_paint = single_point_tile_paint
         elif self._selected_tool == "smudge":
             previous = _rounded_point(self._last_tool_point) if self._last_tool_point else None
             _smudge_disk(result, x, y, radius, previous)
@@ -490,6 +578,8 @@ class EditPaintMixin:
         if self._current_pixels is None:
             return
         self.canvas.clear_paint_preview()
+        if self._paint_preview_regions_published:
+            return
         self.canvas.set_pixels(self._current_pixels, "paint committed", fit=False)
 
     def _begin_paint_stroke(self) -> None:
@@ -503,7 +593,7 @@ class EditPaintMixin:
         self._paint_corruption_event_count = 0
         self._queued_paint_points = []
         self._paint_stroke_layer_id = layer.id
-        if self._selected_tool in {"brush", "pencil", "erase"} and self._base_pixels is not None:
+        if self._selected_tool in {"brush", "pencil", "erase", "clone", "heal"} and self._base_pixels is not None:
             self._begin_tile_paint_session(layer)
         else:
             self._paint_stroke_before = self._snapshot_edit_state()
@@ -658,6 +748,9 @@ class EditPaintMixin:
         self._paint_stroke_points = []
         self._paint_live_points = []
         self._gimp_paint_core.reset()
+        self._clone_stroke_anchor = None
+        self._clone_source_content = None
+        self._clone_source_alpha = None
         self._retouch_stroke_points = []
         self._retouch_stroke_radius = 1.0
         self._retouch_stroke_parameters = {}
@@ -704,235 +797,4 @@ class EditPaintMixin:
         if previous is None:
             return points or [_rounded_point(point)]
         return _deduplicate_points([*points, *_interpolated_points(previous, point, radius)])
-
-    def _begin_layer_move(self, _x: int, _y: int) -> None:
-        self._move_commit_render_timer.stop()
-        layer = self._active_layer()
-        if layer is None:
-            self._status("Select an editable layer first.")
-            return
-        if layer.locked or LayerLock.POSITION in layer.lock_flags:
-            self._status("Cannot move a locked layer.")
-            return
-        self._move_before = self._snapshot_edit_state()
-        self._move_layer_id = layer.id
-        self._move_start_offset = (layer.offset_x, layer.offset_y)
-        self._begin_layer_move_canvas_preview(layer)
-
-    def _preview_layer_move(
-        self,
-        start_x: int,
-        start_y: int,
-        end_x: int,
-        end_y: int,
-        *,
-        force: bool = False,
-    ) -> None:
-        if self._move_layer_id is None or self._move_start_offset is None:
-            return
-        layer = self.project.edit_layers.get(self._move_layer_id)
-        if layer is None:
-            return
-        dx = end_x - start_x
-        dy = end_y - start_y
-        layer.offset_x = self._move_start_offset[0] + dx
-        layer.offset_y = self._move_start_offset[1] + dy
-        self.canvas.move_layer_preview_to(float(layer.offset_x), float(layer.offset_y))
-
-    def _finish_layer_move(self, start_x: int, start_y: int, end_x: int, end_y: int) -> None:
-        if self._move_before is None:
-            self._clear_layer_move()
-            return
-        self._preview_layer_move(start_x, start_y, end_x, end_y, force=True)
-        self._finish_command("move layer", self._move_before)
-        self._invalidate_edit_composite_cache()
-        self._refresh_layers()
-        self._refresh_history()
-        if self.editApplied is not None:
-            self.editApplied()
-        self._move_commit_render_timer.start()
-        self._clear_layer_move()
-
-    def _clear_layer_move(self) -> None:
-        self._move_before = None
-        self._move_layer_id = None
-        self._move_start_offset = None
-
-    def _render_committed_layer_move(self) -> None:
-        if self._move_before is not None:
-            return
-        self.canvas.clear_layer_move_preview()
-        self._invalidate_edit_composite_cache()
-        self._render_current_adjustment_preview()
-
-    def _begin_layer_move_canvas_preview(self, layer: EditLayer) -> None:
-        if self._base_pixels is None or self._current_source_node_id is None:
-            return
-        content, alpha = self._layer_arrays_for_tile_edit(layer)
-        if content is None or alpha is None:
-            return
-        width = self._base_pixels.shape[1]
-        height = self._base_pixels.shape[0]
-        background = self._edit_engine.render_region_excluding(
-            self._current_source_node_id,
-            self._base_pixels,
-            (0, 0, width, height),
-            layer.id,
-        )
-        self.canvas.set_pixels(background, "move preview background", fit=False)
-        self.canvas.begin_layer_move_preview(
-            content,
-            alpha,
-            layer.offset_x,
-            layer.offset_y,
-            opacity=layer.opacity,
-        )
-
-    def _paint_disk_constrained(
-        self,
-        pixels: np.ndarray,
-        center_x: int,
-        center_y: int,
-        radius: int,
-        value: object,
-    ) -> None:
-        paint_disks(
-            pixels,
-            [(center_x, center_y)],
-            radius,
-            value,
-            selection_rect=self._selection_rect,
-            selection_shape=self._selection_shape,
-        )
-
-    def _paint_points_constrained(
-        self,
-        pixels: np.ndarray,
-        points: list[tuple[int, int]],
-        radius: int,
-        value: object,
-    ) -> None:
-        paint_disks(
-            pixels,
-            points,
-            radius,
-            value,
-            selection_rect=self._selection_rect,
-            selection_shape=self._selection_shape,
-        )
-
-    def _paint_stroke_constrained(
-        self,
-        pixels: np.ndarray,
-        points: list[tuple[int, int]],
-        radius: int,
-        value: object,
-    ) -> None:
-        paint_stroke(
-            pixels,
-            points,
-            radius,
-            value,
-            selection_rect=self._selection_rect,
-            selection_shape=self._selection_shape,
-        )
-
-    def _fill_constrained(self, pixels: np.ndarray, value: object) -> None:
-        coverage = self._selection_coverage_mask()
-        if coverage is None or self._selection_rect is None:
-            pixels[...] = value
-            return
-        sx, sy, width, height = self._selection_rect
-        region = pixels[sy : sy + height, sx : sx + width]
-        if region.size == 0:
-            return
-        local_coverage = coverage[sy : sy + height, sx : sx + width]
-        if np.all(local_coverage >= 1.0):
-            region[...] = value
-            return
-        if np.issubdtype(region.dtype, np.integer):
-            dtype = region.dtype
-            target = np.asarray(value, dtype=np.float32)
-            alpha = (
-                1.0 - local_coverage[..., None]
-                if region.ndim == 3
-                else 1.0 - local_coverage
-            )
-            blended = region.astype(np.float32) * alpha
-            if region.ndim == 3:
-                blended += target * local_coverage[..., None]
-            else:
-                blended += float(target) * local_coverage
-            info = np.iinfo(dtype)
-            region[...] = np.clip(np.rint(blended), info.min, info.max).astype(dtype)
-            return
-        if region.ndim == 3:
-            coverage_channels = local_coverage[..., None]
-            region[...] = (
-                region * (1.0 - coverage_channels)
-                + np.asarray(value) * coverage_channels
-            )
-        else:
-            region[...] = region * (1.0 - local_coverage) + float(value) * local_coverage
-
-    def _paint_value(self, pixels: np.ndarray) -> int | float | tuple[int | float, ...]:
-        value = self._foreground_value
-        if np.issubdtype(pixels.dtype, np.integer):
-            max_value = np.iinfo(pixels.dtype).max
-            value = max_value * (value / 255.0)
-        if pixels.ndim == 3:
-            return tuple([value] * pixels.shape[-1])
-        return value
-
-    def _record_retouch_stroke(
-        self, tool: str, x: int, y: int, radius: int, parameters: dict[str, object]
-    ) -> None:
-        if self._paint_stroke_before is not None:
-            self._paint_stroke_operation = tool
-            point = (float(x), float(y))
-            if self._should_record_retouch_point(point):
-                self._retouch_stroke_points.append(point)
-            self._retouch_stroke_radius = float(radius)
-            self._retouch_stroke_parameters = dict(parameters)
-            return
-        if self._current_asset_id is None:
-            return
-        source_node = self.project.source_node_id_for_asset(self._current_asset_id)
-        if source_node is None:
-            return
-        stroke = RetouchStroke(
-            image_node_id=source_node,
-            tool=tool,
-            points=[(float(x), float(y))],
-            radius=float(radius),
-            parameters=parameters,
-        )
-        self.project.retouch_strokes[stroke.id] = stroke
-
-    def _should_record_retouch_point(self, point: tuple[float, float]) -> bool:
-        if self._selected_tool in {"brush", "pencil", "erase"}:
-            return True
-        if not self._retouch_stroke_points:
-            return True
-        previous = self._retouch_stroke_points[-1]
-        return (
-            (point[0] - previous[0]) ** 2 + (point[1] - previous[1]) ** 2
-            >= self._retouch_record_spacing_px**2
-        )
-
-    def _commit_batched_retouch_stroke(self) -> None:
-        if not self._retouch_stroke_points or self._current_asset_id is None:
-            return
-        source_node = self.project.source_node_id_for_asset(self._current_asset_id)
-        if source_node is None:
-            return
-        stroke = RetouchStroke(
-            image_node_id=source_node,
-            tool=self._paint_stroke_operation or self._selected_tool,
-            points=list(self._retouch_stroke_points),
-            radius=self._retouch_stroke_radius,
-            parameters=dict(self._retouch_stroke_parameters),
-            layer_id=self._paint_stroke_layer_id,
-        )
-        self.project.retouch_strokes[stroke.id] = stroke
 

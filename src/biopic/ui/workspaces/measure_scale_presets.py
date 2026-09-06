@@ -47,6 +47,7 @@ class MeasureScalePresetsMixin:
         if self.project.scale_presets:
             for preset in self.project.scale_presets.values():
                 preset_menu = self.set_scale_menu.addMenu(preset.name)
+                preset_menu.setStyleSheet(_MEASURE_SCALE_STYLESHEET)
                 preset_menu.menuAction().setCheckable(True)
                 preset_menu.menuAction().setChecked(self._preset_is_active(preset))
                 for scale in preset.scales:
@@ -160,7 +161,7 @@ class MeasureScalePresetsMixin:
         def add_row() -> None:
             row = table.rowCount()
             table.insertRow(row)
-            for column, value in enumerate(["10x", "Water", "100", "10", "μm", "10"]):
+            for column, value in enumerate(["10x", "Air", "100", "10", "μm", "10"]):
                 table.setItem(row, column, QTableWidgetItem(value))
 
         def remove_row() -> None:
@@ -189,7 +190,7 @@ class MeasureScalePresetsMixin:
         preset.microscope_name = microscope.text().strip()
         preset.imaging_method = imaging_method.text().strip()
         preset.notes = notes.toPlainText().strip()
-        preset.scales = scales
+        preset.scales = self._sorted_scale_rows(scales)
         self._save_persistent_scale_presets()
         self.project.touch()
         self._changed()
@@ -237,6 +238,7 @@ class MeasureScalePresetsMixin:
             return
         data = json.loads(Path(filename).read_text(encoding="utf-8"))
         preset = ScalePreset.from_dict(data)
+        preset.scales = self._sorted_scale_rows(preset.scales)
         self.project.scale_presets[preset.id] = preset
         self._save_persistent_scale_presets()
         self.project.touch()
@@ -251,6 +253,7 @@ class MeasureScalePresetsMixin:
                 preset = ScalePreset.from_dict(item)
             except (KeyError, TypeError, ValueError):
                 continue
+            preset.scales = self._sorted_scale_rows(preset.scales)
             self.project.scale_presets.setdefault(preset.id, preset)
         self._persistent_scale_presets_loaded = True
 
@@ -271,7 +274,7 @@ class MeasureScalePresetsMixin:
         for row in range(table.rowCount()):
             try:
                 magnification = parse_magnification(self._table_text(table, row, 0))
-                fluid = self._table_text(table, row, 1) or "Water"
+                fluid = self._table_text(table, row, 1) or "Air"
                 distance_pixels = float(self._table_text(table, row, 2))
                 known_distance = float(self._table_text(table, row, 3))
                 unit = normalize_unit(self._table_text(table, row, 4) or "μm")
@@ -291,7 +294,17 @@ class MeasureScalePresetsMixin:
                 )
             except ValueError:
                 continue
-        return scales
+        return self._sorted_scale_rows(scales)
+
+    def _sorted_scale_rows(self, scales: list[MagnificationScale]) -> list[MagnificationScale]:
+        return sorted(
+            scales,
+            key=lambda scale: (
+                scale.magnification,
+                scale.fluid.lower(),
+                scale.objective.lower(),
+            ),
+        )
 
     def _update_preset_table_row(self, table: QTableWidget, row: int) -> None:
         if row < 0 or row >= table.rowCount():

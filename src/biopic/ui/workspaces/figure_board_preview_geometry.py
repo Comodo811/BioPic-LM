@@ -250,6 +250,7 @@ class FigureBoardPreviewGeometryMixin:
             pixmap,
             panel_rect,
             max(0.1, panel.crop[2]),
+            float(panel.rotation),
         )
         local_rect = QRectF(-draw_width / 2.0, -draw_height / 2.0, draw_width, draw_height)
         center = self._image_center(panel, panel_rect)
@@ -277,6 +278,7 @@ class FigureBoardPreviewGeometryMixin:
                     pixmap,
                     panel_rect,
                     max(0.1, panel.crop[2]),
+                    float(panel.rotation),
                 )
         min_x = min_visible - draw_width / max(1.0, panel_rect.width()) / 2.0
         max_x = 1.0 - min_visible + draw_width / max(1.0, panel_rect.width()) / 2.0

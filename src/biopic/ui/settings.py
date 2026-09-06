@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -12,9 +13,15 @@ from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QScrollArea, Q
 
 from biopic.app.branding import APP_NAME, APP_ORGANIZATION
 
+DEBUG_OPTIONS_SETTING_KEY = "options/debug_options_enabled"
+SAVE_OPTIONS_SETTING_KEY = "options/project_save"
+
 
 def ui_settings() -> QSettings:
     """Return the application settings store."""
+    settings_file = os.environ.get("BIOPIC_SETTINGS_FILE")
+    if settings_file:
+        return QSettings(settings_file, QSettings.Format.IniFormat)
     return QSettings(APP_ORGANIZATION, APP_NAME)
 
 

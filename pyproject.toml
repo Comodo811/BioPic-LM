@@ -46,12 +46,23 @@ biopic = "biopic.app.main:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+biopic = ["data/*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = [
   "-p",
   "no:cacheprovider",
+  "-p",
+  "no:napari",
+  "-p",
+  "no:napari-plugin-engine",
+  "-p",
+  "no:npe2",
+  "-p",
+  "no:zarr",
 ]
 
 [tool.ruff]

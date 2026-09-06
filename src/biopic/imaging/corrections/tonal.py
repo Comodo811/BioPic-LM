@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
+from scipy import ndimage
 from scipy.interpolate import PchipInterpolator
 
 from biopic.imaging.dtype import restore_dtype, to_float
@@ -25,6 +27,20 @@ class WhiteBalanceEstimate:
     local_variance: float
     sample_count: int
     warning: str | None = None
+    temperature: float | None = None
+    tint: float | None = None
+    correlation: float | None = None
+    histogram_bins: int | None = None
+
+
+WHITE_BALANCE_PRESETS: dict[str, tuple[float, float]] = {
+    "daylight": (5200.0, 1.0),
+    "cloudy": (6000.0, 1.0),
+    "shade": (7000.0, 1.0),
+    "tungsten": (2850.0, 1.0),
+    "fluorescent": (4200.0, 1.15),
+    "flash": (5500.0, 1.0),
+}
 
 
 def levels(
@@ -61,13 +77,22 @@ def gamma_correct(image: np.ndarray, gamma: float) -> np.ndarray:
     if gamma <= 0:
         raise ValueError("gamma must be greater than zero")
     data, dtype = to_float(image)
-    return restore_dtype(np.clip(data, 0.0, 1.0) ** gamma, dtype)
+    adjusted = data.copy()
+    if adjusted.ndim == 3 and adjusted.shape[-1] >= 4:
+        adjusted[..., :3] = np.clip(adjusted[..., :3], 0.0, 1.0) ** gamma
+    else:
+        adjusted = np.clip(adjusted, 0.0, 1.0) ** gamma
+    return restore_dtype(adjusted, dtype)
 
 
 def curve_adjust(
-    image: np.ndarray, points: list[tuple[float, float]], *, channel: str = "rgb"
+    image: np.ndarray,
+    points: list[tuple[float, float]],
+    *,
+    channel: str = "rgb",
+    curve_type: str = "smooth",
 ) -> np.ndarray:
-    """Apply a monotonic PCHIP gradation curve with normalized control points."""
+    """Apply a GIMP-style gradation curve with normalized control points."""
     if len(points) < 2:
         raise ValueError("at least two curve points are required")
     sorted_points = sorted(points)
@@ -77,11 +102,16 @@ def curve_adjust(
         raise ValueError("curve x values must be strictly increasing")
     if xs[0] < 0 or xs[-1] > 1 or np.any((ys < 0) | (ys > 1)):
         raise ValueError("curve points must lie within [0, 1]")
-    interpolator = PchipInterpolator(xs, ys, extrapolate=True)
     data, dtype = to_float(image)
     adjusted = data.copy()
     target = _channel_view(adjusted, channel)
-    target[...] = np.clip(interpolator(np.clip(target, 0.0, 1.0)), 0.0, 1.0)
+    clipped = np.clip(target, 0.0, 1.0)
+    if curve_type.lower() in {"free", "linear", "freehand", "free_hand"}:
+        mapped = np.interp(clipped, xs, ys)
+    else:
+        interpolator = PchipInterpolator(xs, ys, extrapolate=True)
+        mapped = interpolator(clipped)
+    target[...] = np.clip(mapped, 0.0, 1.0)
     return restore_dtype(adjusted, dtype)
 
 
@@ -122,19 +152,54 @@ def white_balance_rendered(
     blue: float = 1.0,
     temperature: float = 6500.0,
     tint: float = 1.0,
+    preset: str = "daylight",
+    blue_red_equalizer: float = 1.0,
+    awb_temperature_bias: float = 0.0,
+    histogram_low_clip: float = 0.2,
+    histogram_high_clip: float = 0.2,
+    histogram_bins: int = 32,
+    raw_metadata: Mapping[str, object] | None = None,
+    camera_matrix_strength: float = 0.0,
     normalize: bool = True,
     sample_rect: tuple[int, int, int, int] | None = None,
     sample_size: int = 16,
 ) -> np.ndarray:
     """Apply rendered-image white balance with RawTherapee-inspired controls.
 
-    ``manual`` applies RGB channel multipliers. ``temperature`` derives gains
-    from a D65-referenced black-body approximation plus green-magenta tint.
-    ``auto`` and ``spot`` derive multipliers from robust neutral statistics.
+    ``manual`` applies RGB channel multipliers. ``temperature`` and ``preset``
+    derive gains from D65-referenced black-body approximations. ``auto`` uses
+    robust neutral statistics. ``auto_temperature`` approximates RawTherapee's
+    histogram-guided temperature-correlation white balance for rendered RGB.
     """
     method = method.lower()
-    if method == "temperature":
+    if method in {"camera", "as_shot"}:
+        gains = _raw_white_balance_gains(raw_metadata, "camera_whitebalance")
+        if gains is None:
+            gains = (red, green, blue)
+        if _raw_camera_wb_already_applied(raw_metadata):
+            gains = (1.0, 1.0, 1.0)
+    elif method in {"daylight", "raw_daylight"}:
+        daylight = _raw_white_balance_gains(raw_metadata, "daylight_whitebalance")
+        camera = _raw_white_balance_gains(raw_metadata, "camera_whitebalance")
+        if daylight is None:
+            gains = white_balance_preset_gains("daylight", tint=tint)
+        elif _raw_camera_wb_already_applied(raw_metadata) and camera is not None:
+            gains = _relative_white_balance_gains(daylight, camera)
+        else:
+            gains = daylight
+    elif method == "preset":
+        gains = white_balance_preset_gains(preset, tint=tint)
+    elif method == "temperature":
         gains = white_balance_gains_from_temperature(temperature, tint=tint)
+    elif method in {"auto_temperature", "temperature_correlation", "itcwb"}:
+        estimate = estimate_white_balance_temperature_correlation(
+            image,
+            temperature_bias=awb_temperature_bias,
+            histogram_low_clip=histogram_low_clip,
+            histogram_high_clip=histogram_high_clip,
+            histogram_bins=histogram_bins,
+        )
+        gains = (estimate.red, estimate.green, estimate.blue)
     elif method in {"auto", "spot"}:
         estimate = estimate_white_balance_from_region(
             image,
@@ -147,8 +212,14 @@ def white_balance_rendered(
         gains = (red, green, blue)
     else:
         raise ValueError(f"Unsupported white-balance method: {method}")
-    return white_balance_multipliers(
+    gains = _apply_blue_red_equalizer(gains, blue_red_equalizer)
+    balanced = white_balance_multipliers(
         image, red=gains[0], green=gains[1], blue=gains[2], normalize=normalize
+    )
+    return apply_raw_camera_profile_matrix(
+        balanced,
+        raw_metadata=raw_metadata,
+        strength=camera_matrix_strength,
     )
 
 
@@ -185,6 +256,146 @@ def white_balance_gains_from_temperature(
     )
 
 
+def white_balance_preset_gains(preset: str, *, tint: float = 1.0) -> tuple[float, float, float]:
+    """Return rendered-image gains for a RawTherapee-style light-source preset."""
+    key = preset.lower().strip().replace(" ", "_")
+    temperature, preset_tint = WHITE_BALANCE_PRESETS.get(key, WHITE_BALANCE_PRESETS["daylight"])
+    return white_balance_gains_from_temperature(temperature, tint=preset_tint * tint)
+
+
+def apply_raw_camera_profile_matrix(
+    image: np.ndarray,
+    *,
+    raw_metadata: Mapping[str, object] | None = None,
+    strength: float = 0.0,
+) -> np.ndarray:
+    """Apply an optional RAW camera RGB-to-sRGB matrix adaptation.
+
+    This is intentionally opt-in because most imported RAW pixels have already
+    been color-converted by the decoder, and rendered formats do not have a
+    camera-native color space.
+    """
+    strength = max(0.0, min(1.0, float(strength)))
+    if strength <= 0.0:
+        return np.asarray(image).copy()
+    matrix = _raw_rgb_to_srgb_matrix(raw_metadata)
+    if matrix is None:
+        return np.asarray(image).copy()
+    data, dtype = to_float(image)
+    if data.ndim < 3 or data.shape[-1] < 3:
+        return restore_dtype(data, dtype)
+    rgb = data[..., :3]
+    converted = np.tensordot(rgb, matrix.T, axes=1)
+    adjusted = data.copy()
+    adjusted[..., :3] = rgb * (1.0 - strength) + converted * strength
+    return restore_dtype(np.clip(adjusted, 0.0, 1.0), dtype)
+
+
+def estimate_white_balance_temperature_correlation(
+    image: np.ndarray,
+    *,
+    temperature_bias: float = 0.0,
+    histogram_low_clip: float = 0.2,
+    histogram_high_clip: float = 0.2,
+    histogram_bins: int = 32,
+) -> WhiteBalanceEstimate:
+    """Estimate WB using a rendered-RGB approximation of RawTherapee ITCWB.
+
+    RawTherapee's real ITCWB operates in the raw pipeline with camera metadata
+    and spectral reference data. For rendered RGB, the closest useful analogue
+    is to denoise lightly, build a chromaticity histogram, keep dominant
+    in-gamut color populations, then search temperature/tint candidates for the
+    correction that makes those populations most chromatically balanced.
+    """
+    data, _dtype = to_float(image)
+    if data.ndim < 3 or data.shape[-1] < 3:
+        return WhiteBalanceEstimate(1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, data.size)
+    rgb = np.asarray(data[..., :3], dtype=np.float32)
+    denoised = ndimage.median_filter(rgb, size=(3, 3, 1), mode="nearest")
+    pixels = denoised.reshape(-1, 3)
+    luminance = pixels @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    low_clip = max(0.0, min(25.0, float(histogram_low_clip)))
+    high_clip = max(0.0, min(25.0, float(histogram_high_clip)))
+    low = float(np.percentile(luminance, low_clip))
+    high = float(np.percentile(luminance, 100.0 - high_clip))
+    valid = (
+        (luminance > max(low, 0.01))
+        & (luminance < min(high, 0.99))
+        & ~np.any((pixels <= 0.001) | (pixels >= 0.999), axis=1)
+    )
+    usable = pixels[valid]
+    if usable.shape[0] < 16:
+        return estimate_white_balance_from_region(image, None, reject_unsuitable=True)
+    if usable.shape[0] > 250_000:
+        step = int(np.ceil(usable.shape[0] / 250_000))
+        usable = usable[::step]
+
+    sums = np.maximum(np.sum(usable, axis=1), 1e-6)
+    red_chroma = usable[:, 0] / sums
+    blue_chroma = usable[:, 2] / sums
+    bins = max(12, min(96, int(histogram_bins)))
+    hist, red_edges, blue_edges = np.histogram2d(
+        red_chroma,
+        blue_chroma,
+        bins=bins,
+        range=((0.0, 1.0), (0.0, 1.0)),
+    )
+    red_bin = np.clip(np.searchsorted(red_edges, red_chroma, side="right") - 1, 0, bins - 1)
+    blue_bin = np.clip(np.searchsorted(blue_edges, blue_chroma, side="right") - 1, 0, bins - 1)
+    populated = hist[red_bin, blue_bin]
+    cutoff = float(np.percentile(hist[hist > 0], 70.0)) if np.any(hist > 0) else 1.0
+    selected = usable[populated >= max(1.0, cutoff)]
+    if selected.shape[0] < 16:
+        selected = usable
+
+    best_score = np.inf
+    best_temperature = 6500.0
+    best_tint = 1.0
+    best_gains = (1.0, 1.0, 1.0)
+    for candidate_temp in np.linspace(2000.0, 15000.0, 132):
+        biased_temp = float(np.clip(candidate_temp + float(temperature_bias), 1500.0, 15000.0))
+        for candidate_tint in np.linspace(0.77, 1.30, 28):
+            gains = white_balance_gains_from_temperature(biased_temp, tint=float(candidate_tint))
+            corrected = selected * np.array(gains, dtype=np.float32)
+            mean = np.maximum(corrected.mean(axis=1), 1e-6)
+            chroma_error = np.mean(np.std(corrected, axis=1) / mean)
+            clipping_penalty = float(np.mean(np.max(corrected, axis=1) > 1.0)) * 0.25
+            score = float(chroma_error + clipping_penalty)
+            if score < best_score:
+                best_score = score
+                best_temperature = biased_temp
+                best_tint = float(candidate_tint)
+                best_gains = gains
+
+    valid_fraction = float(selected.shape[0] / max(1, pixels.shape[0]))
+    clipped_fraction = float(np.count_nonzero(np.any(pixels >= 0.999, axis=1)) / pixels.shape[0])
+    near_black_fraction = float(np.count_nonzero(luminance < 0.02) / pixels.shape[0])
+    saturated_fraction = float(np.count_nonzero(np.max(pixels, axis=1) > 0.98) / pixels.shape[0])
+    warning = _white_balance_warning(
+        valid_fraction=valid_fraction,
+        clipped_fraction=clipped_fraction,
+        near_black_fraction=near_black_fraction,
+        saturated_fraction=saturated_fraction,
+        local_variance=float(np.mean(np.var(selected, axis=0))),
+    )
+    return WhiteBalanceEstimate(
+        red=best_gains[0],
+        green=best_gains[1],
+        blue=best_gains[2],
+        valid_fraction=valid_fraction,
+        clipped_fraction=clipped_fraction,
+        near_black_fraction=near_black_fraction,
+        saturated_fraction=saturated_fraction,
+        local_variance=float(np.mean(np.var(selected, axis=0))),
+        sample_count=int(selected.shape[0]),
+        warning=warning,
+        temperature=best_temperature,
+        tint=best_tint,
+        correlation=best_score,
+        histogram_bins=bins,
+    )
+
+
 def _apply_white_balance_float(
     image: np.ndarray, multipliers: tuple[float, float, float]
 ) -> np.ndarray:
@@ -195,6 +406,88 @@ def _apply_white_balance_float(
     else:
         adjusted = data * float(np.mean(multipliers))
     return restore_dtype(np.clip(adjusted, 0.0, 1.0), dtype)
+
+
+def _apply_blue_red_equalizer(
+    gains: tuple[float, float, float], equalizer: float
+) -> tuple[float, float, float]:
+    equalizer = max(0.25, min(4.0, float(equalizer)))
+    red, green, blue = gains
+    ratio = equalizer ** 0.5
+    return normalized_white_balance_gains(red * ratio, green, blue / ratio, normalize=True)
+
+
+def _raw_white_balance_gains(
+    raw_metadata: Mapping[str, object] | None, key: str
+) -> tuple[float, float, float] | None:
+    if raw_metadata is None:
+        return None
+    value = raw_metadata.get(key)
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return None
+    try:
+        gains = [float(value[index]) for index in range(3)]
+    except (TypeError, ValueError):
+        return None
+    if min(gains) <= 0.0:
+        return None
+    return normalized_white_balance_gains(gains[0], gains[1], gains[2], normalize=True)
+
+
+def _relative_white_balance_gains(
+    target: tuple[float, float, float], current: tuple[float, float, float]
+) -> tuple[float, float, float]:
+    ratios = np.array(target, dtype=np.float32) / np.maximum(
+        np.array(current, dtype=np.float32),
+        1e-6,
+    )
+    return normalized_white_balance_gains(float(ratios[0]), float(ratios[1]), float(ratios[2]))
+
+
+def _raw_camera_wb_already_applied(raw_metadata: Mapping[str, object] | None) -> bool:
+    if raw_metadata is None:
+        return False
+    return bool(raw_metadata.get("raw_import_use_camera_wb", False))
+
+
+def _raw_rgb_to_srgb_matrix(raw_metadata: Mapping[str, object] | None) -> np.ndarray | None:
+    if raw_metadata is None:
+        return None
+    matrix = _coerce_matrix(raw_metadata.get("raw_rgb_xyz_matrix"))
+    if matrix is None:
+        matrix = _coerce_matrix(raw_metadata.get("rgb_xyz_matrix"))
+    if matrix is None:
+        return None
+    if matrix.shape[0] >= 3 and matrix.shape[1] >= 3:
+        camera_to_xyz = matrix[:3, :3].astype(np.float32, copy=False)
+    else:
+        return None
+    xyz_to_srgb = np.array(
+        [
+            [3.2404542, -1.5371385, -0.4985314],
+            [-0.9692660, 1.8760108, 0.0415560],
+            [0.0556434, -0.2040259, 1.0572252],
+        ],
+        dtype=np.float32,
+    )
+    return xyz_to_srgb @ camera_to_xyz
+
+
+def _coerce_matrix(value: object) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        matrix = np.asarray(value, dtype=np.float32)
+    except (TypeError, ValueError):
+        return None
+    if matrix.ndim == 1 and matrix.size in {9, 12}:
+        columns = 3 if matrix.size == 9 else 4
+        matrix = matrix.reshape(3, columns)
+    if matrix.ndim != 2 or matrix.shape[0] < 3 or matrix.shape[1] < 3:
+        return None
+    if not np.isfinite(matrix).all():
+        return None
+    return matrix
 
 
 def _blackbody_rgb_approx(temperature: float) -> np.ndarray:
@@ -324,7 +617,9 @@ def _white_balance_warning(
 def _channel_view(data: np.ndarray, channel: str) -> np.ndarray:
     if data.ndim < 3 or data.shape[-1] < 3 or channel in {"rgb", "luminance"}:
         return data
-    channels = {"red": 0, "green": 1, "blue": 2}
+    channels = {"red": 0, "green": 1, "blue": 2, "alpha": 3}
     if channel not in channels:
         raise ValueError(f"Unsupported channel: {channel}")
+    if channels[channel] >= data.shape[-1]:
+        raise ValueError(f"Image has no {channel} channel")
     return data[..., channels[channel]]

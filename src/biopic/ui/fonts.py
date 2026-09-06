@@ -14,8 +14,8 @@ UNSAFE_FONT_FAMILIES = {
 }
 
 SAFE_FONT_FALLBACKS = (
-    "Segoe UI",
     "Arial",
+    "Segoe UI",
     "Helvetica",
     "Times New Roman",
 )

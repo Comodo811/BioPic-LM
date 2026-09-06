@@ -56,6 +56,8 @@ class Project:
     undo_stack: list[dict[str, Any]] = field(default_factory=list)
     redo_stack: list[dict[str, Any]] = field(default_factory=list)
     history: list[dict[str, Any]] = field(default_factory=list)
+    _archive_clean_modified_at: str | None = field(default=None, repr=False)
+    _archive_clean_save_options: dict[str, Any] | None = field(default=None, repr=False)
 
     @classmethod
     def new(cls, name: str) -> Project:
@@ -65,6 +67,20 @@ class Project:
     def touch(self) -> None:
         """Update modification timestamp."""
         self.modified_at = datetime.now(UTC).isoformat()
+
+    def mark_archive_clean(self, save_options: dict[str, Any] | None = None) -> None:
+        """Remember that archive outputs match the current project state."""
+        self._archive_clean_modified_at = self.modified_at
+        if save_options is not None:
+            self._archive_clean_save_options = save_options
+
+    def archive_is_dirty(self, save_options: dict[str, Any] | None = None) -> bool:
+        """Return whether project-owned archive outputs may need updating."""
+        if self._archive_clean_modified_at != self.modified_at:
+            return True
+        if save_options is None:
+            return False
+        return self._archive_clean_save_options != save_options
 
     def add_asset(self, asset: ImageAsset) -> None:
         """Add a source image asset."""
@@ -274,4 +290,5 @@ class Project:
             redo_stack=list(data.get("redo_stack", [])),
             history=list(data.get("history", [])),
         )
+        project.mark_archive_clean()
         return project

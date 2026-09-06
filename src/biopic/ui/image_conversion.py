@@ -127,6 +127,8 @@ def display_range(pixels: np.ndarray) -> tuple[float, float] | None:
         return (0.0, 1.0)
     low = float(np.min(finite))
     high = float(np.max(finite))
+    if np.issubdtype(array.dtype, np.floating) and low >= 0.0 and high <= 1.0:
+        return (0.0, 1.0)
     if high > low:
         return (low, high)
     if np.issubdtype(array.dtype, np.integer):

@@ -30,3 +30,28 @@ def test_graph_rejects_missing_inputs() -> None:
         assert "Unknown input" in str(exc)
     else:
         raise AssertionError("Expected missing dependency to fail")
+
+
+def test_graph_load_prunes_legacy_missing_inputs() -> None:
+    graph = ProcessingGraph.from_dict(
+        {
+            "nodes": [
+                {
+                    "id": "legacy-adjustment",
+                    "operation": "levels",
+                    "inputs": ["missing-source"],
+                    "parameters": {},
+                    "version": 1,
+                    "status": "complete",
+                    "cache_key": "old-cache",
+                    "provenance": {},
+                }
+            ]
+        }
+    )
+
+    node = graph.nodes["legacy-adjustment"]
+    assert node.inputs == ()
+    assert node.status is NodeStatus.STALE
+    assert node.cache_key is None
+    assert node.provenance["legacy_missing_inputs_removed"] == ["missing-source"]

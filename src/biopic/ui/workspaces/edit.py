@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable
 from pathlib import Path
-from time import perf_counter
-
 import numpy as np
 from PySide6.QtCore import (
+    QEvent,
     QSize,
     Qt,
     QTimer,
@@ -32,24 +30,23 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
+    QSlider,
     QSplitter,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from biopic.imaging.editing import apply_edit_operation
 from biopic.imaging.engine import ImageEditingEngine
 from biopic.imaging.io import load_asset_pixels
-from biopic.imaging.layer_buffers import (
-    set_layer_buffers,
-)
 from biopic.imaging.paint_engine import (
     GimpPaintCore,
     PaintWorkQueue,
 )
 from biopic.imaging.project_render import (
     editable_assets,
+    project_image_cache_key,
 )
 from biopic.imaging.regions import DirtyRegion
 from biopic.imaging.selection import (
@@ -58,14 +55,11 @@ from biopic.imaging.selection import (
 )
 from biopic.imaging.tiles import TilePaintSession
 from biopic.models.editing import (
-    AdjustmentLayer,
     EditLayer,
     LayerContentKind,
-    LayerLock,
 )
 from biopic.models.image_asset import ImageAsset
 from biopic.models.project import Project
-from biopic.pipeline.node import ProcessingNode
 from biopic.ui.image_canvas import ImageCanvas
 from biopic.ui.previews import asset_thumbnail
 from biopic.ui.workspace_helpers.common import (
@@ -77,21 +71,6 @@ from biopic.ui.workspace_helpers.icons import (
 from biopic.ui.workspace_helpers.icons import (
     tool_icon as _tool_icon,
 )
-from biopic.ui.workspace_helpers.layers import (
-    layer_icon as _layer_icon,
-)
-from biopic.ui.workspace_helpers.layers import (
-    layer_label as _layer_label,
-)
-from biopic.ui.workspace_helpers.operations import (
-    is_adjustment_operation as _is_adjustment_operation,
-)
-from biopic.ui.workspace_helpers.operations import (
-    is_filter_result_layer_operation as _is_filter_result_layer_operation,
-)
-from biopic.ui.workspace_helpers.operations import (
-    operation_layer_name as _operation_layer_name,
-)
 from biopic.ui.workspaces.edit_background import EditBackgroundMixin
 from biopic.ui.workspaces.edit_constants import (
     GIMP_TOOL_HELP as _GIMP_TOOL_HELP,
@@ -102,21 +81,24 @@ from biopic.ui.workspaces.edit_constants import (
 from biopic.ui.workspaces.edit_filter_dialogs import EditFilterDialogsMixin
 from biopic.ui.workspaces.edit_history import EditHistoryMixin
 from biopic.ui.workspaces.edit_layer_commands import EditLayerCommandsMixin
+from biopic.ui.workspaces.edit_layer_panels import EditLayerPanelsMixin
+from biopic.ui.workspaces.edit_operations import EditOperationsMixin
 from biopic.ui.workspaces.edit_paint import EditPaintMixin
 from biopic.ui.workspaces.edit_paint_preview import EditPaintPreviewMixin
+from biopic.ui.workspaces.edit_progress import EditProgressMixin
 from biopic.ui.workspaces.edit_rendering import EditRenderingMixin
 from biopic.ui.workspaces.edit_selection import EditSelectionMixin
-
-LOGGER = logging.getLogger(__name__)
-
 
 class EditWorkspace(
     EditBackgroundMixin,
     EditFilterDialogsMixin,
     EditHistoryMixin,
     EditLayerCommandsMixin,
+    EditLayerPanelsMixin,
+    EditOperationsMixin,
     EditPaintMixin,
     EditPaintPreviewMixin,
+    EditProgressMixin,
     EditRenderingMixin,
     EditSelectionMixin,
     QWidget,
@@ -144,6 +126,8 @@ class EditWorkspace(
         self._clipboard_alpha: np.ndarray | None = None
         self._foreground_value = 255.0
         self._editable_assets: list[ImageAsset] = []
+        self._asset_list_signature: tuple[object, ...] | None = None
+        self._loaded_asset_signature: tuple[object, ...] | None = None
         self._selected_tool = "pan"
         self._selection_rect: tuple[int, int, int, int] | None = None
         self._selection_shape = "rectangle"
@@ -169,6 +153,10 @@ class EditWorkspace(
         self._paint_stroke_points: list[tuple[float, float]] = []
         self._paint_live_points: list[tuple[float, float]] = []
         self._gimp_paint_core = GimpPaintCore()
+        self._clone_source_point: tuple[int, int] | None = None
+        self._clone_stroke_anchor: tuple[int, int] | None = None
+        self._clone_source_content: np.ndarray | None = None
+        self._clone_source_alpha: np.ndarray | None = None
         self._retouch_stroke_points: list[tuple[float, float]] = []
         self._retouch_stroke_radius = 1.0
         self._retouch_stroke_parameters: dict[str, object] = {}
@@ -196,6 +184,16 @@ class EditWorkspace(
         self._selection_persist_timer.setSingleShot(True)
         self._selection_persist_timer.setInterval(250)
         self._selection_persist_timer.timeout.connect(self._flush_pending_selection_persistence)
+        self._layer_opacity_render_timer = QTimer(self)
+        self._layer_opacity_render_timer.setSingleShot(True)
+        self._layer_opacity_render_timer.setInterval(35)
+        self._layer_opacity_render_timer.timeout.connect(self._flush_pending_layer_opacity_render)
+        self._layer_opacity_commit_timer = QTimer(self)
+        self._layer_opacity_commit_timer.setSingleShot(True)
+        self._layer_opacity_commit_timer.setInterval(300)
+        self._layer_opacity_commit_timer.timeout.connect(self._commit_pending_layer_opacity_change)
+        self._pending_layer_opacity_command: tuple[str, dict[str, object]] | None = None
+        self._pending_layer_opacity_render = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -294,17 +292,18 @@ class EditWorkspace(
         for label, operation in [
             ("Gamma", "gamma"),
             ("White Balance", "white_balance"),
+            ("Flat-Field Correction", "flat_field_correction_estimated"),
             ("Levels", "levels"),
             ("Curves", "curve"),
             ("Auto Levels", "auto_levels"),
             ("Color / Saturation", "color_saturation"),
             ("High Pass", "high_pass"),
+            ("Denoise", "denoise"),
             ("Gaussian Smooth", "gaussian"),
             ("Median Filter", "median"),
             ("Invert", "invert"),
             ("Threshold", "threshold"),
             ("Sharpen", "sharpen"),
-            ("Denoise", "denoise"),
             ("TV Denoise", "total_variation"),
             ("Wavelet Sharpen", "wavelet_sharpen"),
             ("Local Contrast", "local_contrast"),
@@ -313,11 +312,19 @@ class EditWorkspace(
             ("Flip Horizontal", "flip_horizontal"),
             ("Flip Vertical", "flip_vertical"),
             ("Crop Selection", "crop"),
-            ("Flat-Field Correction", "flat_field_correction_estimated"),
-            ("Uniform Background Outside Selection", "uniform_background_outside_selection"),
+            (
+                "Uniform Background Outside Selection (Stamp)",
+                "uniform_background_outside_selection",
+            ),
+            (
+                "Uniform Background Outside Selection (Heal)",
+                "healed_uniform_background_outside_selection",
+            ),
         ]:
             self.operation_combo.addItem(label, operation)
         self.apply_button = QPushButton("Apply")
+        self.crop_rotated_button = QPushButton("Crop Rotated Image")
+        self.fill_rotated_background_button = QPushButton("Fill Rotated Background")
         self.fit_button = QPushButton("Fit")
         self.actual_button = QPushButton("100%")
         self.external_editor_button = QPushButton("Open in GIMP/Krita")
@@ -325,17 +332,14 @@ class EditWorkspace(
         center_controls.addWidget(QLabel("Operation"))
         center_controls.addWidget(self.operation_combo)
         center_controls.addWidget(self.apply_button)
+        center_controls.addWidget(self.crop_rotated_button)
+        center_controls.addWidget(self.fill_rotated_background_button)
         center_controls.addWidget(self.fit_button)
         center_controls.addWidget(self.actual_button)
         center_controls.addWidget(self.external_editor_button)
         center_controls.addWidget(self.import_external_button)
         center_controls.addStretch(1)
         center_layout.addLayout(center_controls)
-        for control_index in range(center_controls.count()):
-            item = center_controls.itemAt(control_index)
-            widget = item.widget() if item is not None else None
-            if widget is not None:
-                widget.setVisible(False)
         self.high_pass_options = QGroupBox("High Pass Options")
         high_pass_layout = QFormLayout(self.high_pass_options)
         self.high_pass_radius_spin = QDoubleSpinBox()
@@ -344,9 +348,9 @@ class EditWorkspace(
         self.high_pass_radius_spin.setValue(1.2)
         self.high_pass_radius_spin.setSuffix(" px")
         self.high_pass_amount_spin = QDoubleSpinBox()
-        self.high_pass_amount_spin.setRange(0.0, 8.0)
+        self.high_pass_amount_spin.setRange(0.0, 5.0)
         self.high_pass_amount_spin.setSingleStep(0.1)
-        self.high_pass_amount_spin.setValue(2.0)
+        self.high_pass_amount_spin.setValue(1.0)
         self.high_pass_threshold_spin = QDoubleSpinBox()
         self.high_pass_threshold_spin.setRange(0.0, 0.25)
         self.high_pass_threshold_spin.setSingleStep(0.0025)
@@ -359,10 +363,7 @@ class EditWorkspace(
         self.high_pass_luminance_check = QCheckBox("Luminance only")
         self.high_pass_luminance_check.setChecked(True)
         high_pass_layout.addRow("Radius", self.high_pass_radius_spin)
-        high_pass_layout.addRow("Amount", self.high_pass_amount_spin)
-        high_pass_layout.addRow("Threshold", self.high_pass_threshold_spin)
-        high_pass_layout.addRow("Halo control", self.high_pass_halo_spin)
-        high_pass_layout.addRow(self.high_pass_luminance_check)
+        high_pass_layout.addRow("Contrast", self.high_pass_amount_spin)
         center_layout.addWidget(self.high_pass_options)
         self.high_pass_options.setVisible(False)
         self.canvas = ImageCanvas()
@@ -381,6 +382,7 @@ class EditWorkspace(
         self.add_layer_button = QPushButton()
         self.remove_layer_button = QPushButton()
         self.duplicate_layer_button = QPushButton()
+        self.merge_layer_down_button = QPushButton("Merge Down")
         self.raise_layer_button = QPushButton("Up")
         self.lower_layer_button = QPushButton("Down")
         _set_button_icon(self.add_layer_button, "new_layer_icon.png", "New Layer")
@@ -389,6 +391,7 @@ class EditWorkspace(
         layer_controls.addWidget(self.add_layer_button)
         layer_controls.addWidget(self.remove_layer_button)
         layer_controls.addWidget(self.duplicate_layer_button)
+        layer_controls.addWidget(self.merge_layer_down_button)
         layer_controls.addWidget(self.raise_layer_button)
         layer_controls.addWidget(self.lower_layer_button)
         layer_controls.addStretch(1)
@@ -397,6 +400,12 @@ class EditWorkspace(
         self.layer_opacity_spin = QDoubleSpinBox()
         self.layer_opacity_spin.setRange(0.0, 100.0)
         self.layer_opacity_spin.setValue(100.0)
+        self.layer_opacity_spin.setSingleStep(1.0)
+        self.layer_opacity_spin.setSuffix("%")
+        self.layer_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.layer_opacity_slider.setRange(0, 100)
+        self.layer_opacity_slider.setValue(100)
+        self.layer_opacity_slider.setTracking(True)
         self.layer_blend_combo = QComboBox()
         self.layer_blend_combo.addItems(["normal", "add", "multiply", "screen"])
         self.layer_visible_check = QCheckBox("Visible")
@@ -405,6 +414,7 @@ class EditWorkspace(
         self.layer_position_lock_check = QCheckBox("Lock Position")
         self.layer_visibility_lock_check = QCheckBox("Lock Visibility")
         layer_options.addWidget(QLabel("Opacity"))
+        layer_options.addWidget(self.layer_opacity_slider, 1)
         layer_options.addWidget(self.layer_opacity_spin)
         layer_options.addWidget(QLabel("Mode"))
         layer_options.addWidget(self.layer_blend_combo)
@@ -448,6 +458,9 @@ class EditWorkspace(
         self.asset_list.currentRowChanged.connect(self._select_asset_row)
         self.operation_combo.currentIndexChanged.connect(self._operation_changed)
         self.apply_button.clicked.connect(self.apply_current_operation)
+        self.crop_rotated_button.clicked.connect(self.crop_rotated_image)
+        self.crop_rotated_button.installEventFilter(self)
+        self.fill_rotated_background_button.clicked.connect(self.fill_rotated_background)
         self.selection_mode_combo.currentIndexChanged.connect(self._selection_options_changed)
         self.selection_antialias_check.toggled.connect(self._selection_options_changed)
         self.selection_feather_check.toggled.connect(self._selection_options_changed)
@@ -460,20 +473,26 @@ class EditWorkspace(
         self.canvas.paintPointMoved.connect(self._paint_point_moved)
         self.canvas.paintStrokeStarted.connect(self._begin_paint_stroke)
         self.canvas.paintStrokeFinished.connect(self._finish_paint_stroke)
+        self.canvas.cloneSourceSelected.connect(self._set_clone_source_point)
         self.canvas.viewZoomAboutToChange.connect(self._flush_all_queued_paint_points)
         self.canvas.layerDragStarted.connect(self._begin_layer_move)
         self.canvas.layerDragMoved.connect(self._preview_layer_move)
         self.canvas.layerDragFinished.connect(self._finish_layer_move)
         self.canvas.rectangleSelected.connect(self._tool_rectangle_selected)
         self.canvas.selectionCompleted.connect(self._tool_selection_completed)
+        self.canvas.rotationCommitted.connect(self.rotate_current_image)
         self.add_layer_button.clicked.connect(lambda _checked=False: self.add_empty_layer())
         self.remove_layer_button.clicked.connect(self.remove_selected_layer)
         self.duplicate_layer_button.clicked.connect(self.duplicate_selected_layer)
+        self.merge_layer_down_button.clicked.connect(self.merge_selected_layer_down)
         self.raise_layer_button.clicked.connect(self.raise_selected_layer)
         self.lower_layer_button.clicked.connect(self.lower_selected_layer)
         self.layers_list.currentItemChanged.connect(self._selected_layer_changed)
         self.layers_list.model().rowsMoved.connect(self._layers_rows_moved)
-        self.layer_opacity_spin.valueChanged.connect(self._apply_layer_controls)
+        self.layer_opacity_slider.valueChanged.connect(self._layer_opacity_slider_changed)
+        self.layer_opacity_slider.sliderReleased.connect(self._commit_pending_layer_opacity_change)
+        self.layer_opacity_spin.valueChanged.connect(self._layer_opacity_spin_changed)
+        self.layer_opacity_spin.editingFinished.connect(self._commit_pending_layer_opacity_change)
         self.layer_blend_combo.currentTextChanged.connect(self._apply_layer_controls)
         self.layer_visible_check.toggled.connect(self._apply_layer_controls)
         self.layer_lock_check.toggled.connect(self._apply_layer_controls)
@@ -488,20 +507,32 @@ class EditWorkspace(
     def refresh(self) -> None:
         """Refresh asset choices, layers, and history."""
         current = self._current_asset_id
-        self.asset_list.blockSignals(True)
-        self.asset_list.clear()
         assets = editable_assets(self.project)
         if self._asset_filter_ids is not None:
             assets = [asset for asset in assets if asset.id in self._asset_filter_ids]
-        self._editable_assets = assets
-        for asset in self._editable_assets:
-            item = QListWidgetItem(
-                QIcon(asset_thumbnail(asset, QSize(170, 120))),
+        asset_list_signature = tuple(
+            (
+                asset.id,
                 _editable_asset_label(asset),
+                asset.checksum or asset.path,
             )
-            item.setData(256, asset.id)
-            self.asset_list.addItem(item)
-        self.asset_list.blockSignals(False)
+            for asset in assets
+        )
+        if asset_list_signature != self._asset_list_signature:
+            self.asset_list.blockSignals(True)
+            self.asset_list.clear()
+            self._editable_assets = assets
+            for asset in self._editable_assets:
+                item = QListWidgetItem(
+                    QIcon(asset_thumbnail(asset, QSize(170, 120))),
+                    _editable_asset_label(asset),
+                )
+                item.setData(256, asset.id)
+                self.asset_list.addItem(item)
+            self.asset_list.blockSignals(False)
+            self._asset_list_signature = asset_list_signature
+        else:
+            self._editable_assets = assets
         if current:
             index = next(
                 (i for i, asset in enumerate(self._editable_assets) if asset.id == current),
@@ -511,7 +542,16 @@ class EditWorkspace(
                 self.asset_list.setCurrentRow(index)
         if self.asset_list.count() and self.asset_list.currentRow() < 0:
             self.asset_list.setCurrentRow(0)
-        self._select_asset_row(self.asset_list.currentRow())
+        row = self.asset_list.currentRow()
+        if 0 <= row < len(self._editable_assets):
+            selected_asset = self._editable_assets[row]
+            selected_signature = self._asset_render_signature(selected_asset)
+            if (
+                self._base_pixels is None
+                or self._current_asset_id != selected_asset.id
+                or self._loaded_asset_signature != selected_signature
+            ):
+                self._select_asset_row(row)
         self._refresh_layers()
         self._refresh_adjustments()
         self._refresh_history()
@@ -522,36 +562,13 @@ class EditWorkspace(
         self._current_asset_id = None
         self.refresh()
 
-    def apply_current_operation(self) -> None:
-        """Apply an edit operation, display it, and record a processing node."""
-        if self._current_pixels is None or self._current_asset_id is None:
-            return
-        operation = str(self.operation_combo.currentData())
-        parameters = self._parameters(operation)
-        if _is_filter_result_layer_operation(operation):
-            start = perf_counter()
-            result = apply_edit_operation(self._current_pixels, operation, parameters)
-            LOGGER.debug(
-                "edit filter %s computed in %.3fs for shape=%s dtype=%s",
-                operation,
-                perf_counter() - start,
-                getattr(result, "shape", None),
-                getattr(result, "dtype", None),
-            )
-            self._commit_filter_result_layer(result, operation, parameters)
-            return
-        if _is_adjustment_operation(operation):
-            self._upsert_adjustment_layer_from_operation(operation, parameters)
-            self._render_current_adjustment_preview()
-            self._refresh_adjustments()
-            return
-        result = apply_edit_operation(self._current_pixels, operation, parameters)
-        self._commit_edit_result(
-            result,
-            operation,
-            parameters,
-            adjustment_operation=_is_adjustment_operation(operation),
-        )
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if watched is self.crop_rotated_button:
+            if event.type() == QEvent.Type.Enter:
+                self.show_rotated_crop_preview()
+            elif event.type() in {QEvent.Type.Leave, QEvent.Type.Hide}:
+                self.canvas.clear_crop_cut_preview()
+        return super().eventFilter(watched, event)
 
     def select_tool(self, tool_id: str) -> None:
         """Select a GIMP-like editing tool."""
@@ -642,6 +659,7 @@ class EditWorkspace(
         self._current_source_node_id = self.project.source_node_id_for_asset(asset.id)
         self._base_pixels = load_asset_pixels(asset)
         self._current_pixels = self._base_pixels.copy()
+        self._loaded_asset_signature = self._asset_render_signature(asset)
         self._selection_rect = None
         self._selection_coverage = None
         self._selection_polygon = []
@@ -656,6 +674,15 @@ class EditWorkspace(
         self._render_current_adjustment_preview()
         self._refresh_layers()
         self._refresh_adjustments()
+
+    def _asset_render_signature(self, asset: ImageAsset) -> tuple[object, ...]:
+        node_id = self.project.source_node_id_for_asset(asset.id)
+        return (
+            asset.id,
+            asset.checksum or asset.path,
+            node_id,
+            project_image_cache_key(self.project, node_id) if node_id is not None else None,
+        )
 
     def _operation_changed(self) -> None:
         operation = str(self.operation_combo.currentData())
@@ -695,9 +722,9 @@ class EditWorkspace(
             self.primary_spin.setSingleStep(0.05)
             self.primary_spin.setValue(0.5)
         elif operation == "denoise":
-            self.primary_spin.setRange(3.0, 15.0)
-            self.primary_spin.setSingleStep(2.0)
-            self.primary_spin.setValue(5.0)
+            self.primary_spin.setRange(0.0, 8.0)
+            self.primary_spin.setSingleStep(1.0)
+            self.primary_spin.setValue(4.0)
         elif operation == "total_variation":
             self.primary_spin.setRange(0.01, 0.5)
             self.primary_spin.setSingleStep(0.01)
@@ -718,7 +745,10 @@ class EditWorkspace(
             self.primary_spin.setRange(2.0, 120.0)
             self.primary_spin.setSingleStep(2.0)
             self.primary_spin.setValue(24.0)
-        elif operation == "uniform_background_outside_selection":
+        elif operation in {
+            "uniform_background_outside_selection",
+            "healed_uniform_background_outside_selection",
+        }:
             self.primary_spin.setRange(0.0, 1.0)
             self.primary_spin.setValue(1.0)
         elif operation in {"rotate_90", "flip_horizontal", "flip_vertical"}:
@@ -727,117 +757,6 @@ class EditWorkspace(
         else:
             self.primary_spin.setRange(0.0, 10.0)
             self.primary_spin.setValue(0.5)
-
-    def _parameters(self, operation: str) -> dict[str, object]:
-        value = self.primary_spin.value()
-        secondary = self.secondary_spin.value()
-        if operation == "gamma":
-            return {"gamma": value}
-        if operation == "white_balance":
-            return {"red": value, "green": 1.0, "blue": secondary, "normalize": True}
-        if operation == "color_saturation":
-            return {
-                "range": "all",
-                "hue": 0.0,
-                "saturation": value,
-                "lightness": secondary,
-                "overlap": 0.0,
-            }
-        if operation == "levels":
-            return {
-                "black_point": 0.0,
-                "white_point": 1.0,
-                "midtone": max(value, 0.01),
-                "output_black": 0.0,
-                "output_white": 1.0,
-                "channel": "rgb",
-            }
-        if operation == "curve":
-            return {"points": [(0.0, 0.0), (0.5, value / 2.0), (1.0, 1.0)], "channel": "rgb"}
-        if operation == "auto_levels":
-            return {"percentile": value}
-        if operation == "high_pass":
-            return {
-                "sigma": self.high_pass_radius_spin.value(),
-                "amount": self.high_pass_amount_spin.value(),
-                "threshold": self.high_pass_threshold_spin.value(),
-                "halo_suppression": self.high_pass_halo_spin.value(),
-                "luminance_only": self.high_pass_luminance_check.isChecked(),
-            }
-        if operation == "gaussian":
-            return {"sigma": value}
-        if operation == "median":
-            return {"radius": int(round(value))}
-        if operation == "threshold":
-            return {"threshold": value}
-        if operation == "sharpen":
-            return {"sigma": max(value, 0.01), "amount": 1.0}
-        if operation == "denoise":
-            return {
-                "method": "microscopy",
-                "luminance_strength": 0.16,
-                "chroma_strength": 0.10,
-                "impulse_radius": 1,
-                "preserve_edges": True,
-            }
-        if operation == "total_variation":
-            return {"weight": value}
-        if operation == "wavelet_sharpen":
-            return {
-                "levels": 4,
-                "amount": value,
-                "threshold": 0.01,
-                "luminance_only": False,
-            }
-        if operation == "local_contrast":
-            return {
-                "radius": value,
-                "amount": 0.25,
-                "threshold": 0.01,
-                "shadow_protection": 0.25,
-                "highlight_protection": 0.05,
-                "halo_suppression": 0.25,
-                "luminance_only": True,
-            }
-        if operation == "deconvolution":
-            return {"radius": value, "iterations": 8, "amount": 0.5, "damping": 0.001}
-        if operation == "rotate_90":
-            return {"turns": int(round(value))}
-        if operation == "scale_uniform":
-            return {"scale": max(0.05, value / 100.0)}
-        if operation == "crop" and self._selection_rect is not None:
-            x, y, width, height = self._selection_rect
-            return {"x": x, "y": y, "width": width, "height": height}
-        if operation == "flat_field_correction_estimated":
-            return {"sigma": value, "strength": 1.0, "preserve_mean": True}
-        if operation == "subtract_background_estimated":
-            return {"sigma": value, "amount": 1.0}
-        if operation == "uniform_background_outside_selection":
-            return {"selection_mask": self._selection_mask()}
-        return {}
-
-    def apply_named_operation(
-        self, operation: str, parameters_override: dict[str, object] | None = None
-    ) -> None:
-        """Apply an operation directly from a context-toolbar menu."""
-        if self._current_pixels is None:
-            return
-        index = self.operation_combo.findData(operation)
-        if index >= 0:
-            self.operation_combo.setCurrentIndex(index)
-        parameters = self._parameters(operation)
-        if parameters_override:
-            parameters.update(parameters_override)
-        if _is_adjustment_operation(operation):
-            self._upsert_adjustment_layer_from_operation(operation, parameters)
-            self._render_current_adjustment_preview()
-            self._refresh_adjustments()
-            return
-        result = apply_edit_operation(self._current_pixels, operation, parameters)
-        if _is_filter_result_layer_operation(operation):
-            self._commit_filter_result_layer(result, operation, parameters)
-        else:
-            self._commit_edit_result(result, operation, parameters)
 
     def _configure_tool_options(self, tool_id: str) -> None:
         if tool_id in {
@@ -875,197 +794,12 @@ class EditWorkspace(
             self.primary_spin.setValue(100.0)
             self.secondary_spin.setEnabled(False)
         elif tool_id == "rotate":
-            self.primary_spin.setRange(1.0, 4.0)
+            self.primary_spin.setRange(-180.0, 180.0)
             self.primary_spin.setSingleStep(1.0)
-            self.primary_spin.setValue(1.0)
+            self.primary_spin.setValue(0.0)
             self.secondary_spin.setEnabled(False)
         else:
             self.secondary_spin.setEnabled(True)
-
-    def _commit_edit_result(
-        self,
-        result: np.ndarray,
-        operation: str,
-        parameters: dict[str, object],
-        *,
-        adjustment_operation: bool = False,
-    ) -> None:
-        self._current_pixels = result
-        self.canvas.set_pixels(result, f"{operation} preview")
-        source_node = (
-            self.project.source_node_id_for_asset(self._current_asset_id)
-            if self._current_asset_id is not None
-            else None
-        )
-        inputs = () if source_node is None else (source_node,)
-        node = ProcessingNode(
-            operation=f"edit.{operation}",
-            inputs=inputs,
-            parameters=parameters,
-            provenance={"non_destructive": True, "tool": self._selected_tool},
-        )
-        self.project.graph.add_node(node)
-        if adjustment_operation:
-            self._add_adjustment_layer(operation, parameters, node)
-        self.project.touch()
-        self._refresh_history()
-        self._refresh_adjustments()
-        if self.editApplied is not None:
-            self.editApplied()
-
-    def _commit_filter_result_layer(
-        self, result: np.ndarray, operation: str, parameters: dict[str, object]
-    ) -> None:
-        """Store an applied correction/filter as a separate raster result layer."""
-        commit_start = perf_counter()
-        if self._current_asset_id is None:
-            return
-        source_node = self.project.source_node_id_for_asset(self._current_asset_id)
-        if source_node is None:
-            return
-        before = self._snapshot_edit_state()
-        node = ProcessingNode(
-            operation=f"filter-layer.{operation}",
-            inputs=(source_node,),
-            parameters=dict(parameters),
-            provenance={
-                "non_destructive": True,
-                "layer_result": True,
-                "source": "current rendered edit image",
-            },
-        )
-        self.project.graph.add_node(node)
-        layer = EditLayer(
-            name=_operation_layer_name(operation),
-            source_node_id=source_node,
-            content_kind=LayerContentKind.RASTER,
-            order=self._next_layer_order(source_node),
-        )
-        alpha = np.ones(result.shape[:2], dtype=np.float32)
-        layer.bump_generation()
-        self.project.edit_layers[layer.id] = layer
-        set_layer_buffers(layer.id, result, alpha)
-        self.project.active_edit_layers[source_node] = layer.id
-        self._current_layer_id = layer.id
-        self._current_pixels = result
-        self._edit_composite_cache = result
-        self._edit_composite_cache_key = self._edit_composite_key(source_node)
-        self._finish_command(f"add {layer.name} layer", before)
-        after_history = perf_counter()
-        self._refresh_layers()
-        after_layers = perf_counter()
-        self._render_current_adjustment_preview()
-        after_render = perf_counter()
-        LOGGER.debug(
-            "edit filter %s committed in %.3fs (history %.3fs, layers %.3fs, render %.3fs)",
-            operation,
-            after_render - commit_start,
-            after_history - commit_start,
-            after_layers - after_history,
-            after_render - after_layers,
-        )
-        if self.editApplied is not None:
-            self.editApplied()
-
-    def _add_adjustment_layer(
-        self, operation: str, parameters: dict[str, object], node: ProcessingNode
-    ) -> None:
-        if self._current_asset_id is None:
-            return
-        source_node = self.project.source_node_id_for_asset(self._current_asset_id)
-        image_node_id = source_node or node.id
-        order = sum(
-            1
-            for layer in self.project.adjustment_layers.values()
-            if layer.image_node_id == image_node_id
-        )
-        layer = AdjustmentLayer(
-            name=operation.replace("_", " ").title(),
-            image_node_id=image_node_id,
-            operation=operation,
-            parameters=dict(parameters),
-            order=order,
-        )
-        self.project.add_adjustment_layer(layer)
-
-    def _add_adjustment_layer_from_operation(
-        self, operation: str, parameters: dict[str, object]
-    ) -> None:
-        self._upsert_adjustment_layer_from_operation(operation, parameters, replace_existing=False)
-
-    def _upsert_adjustment_layer_from_operation(
-        self,
-        operation: str,
-        parameters: dict[str, object],
-        *,
-        replace_existing: bool = True,
-    ) -> None:
-        if self._current_asset_id is None:
-            return
-        source_node = self.project.source_node_id_for_asset(self._current_asset_id)
-        if source_node is None:
-            return
-        if replace_existing:
-            existing = next(
-                (
-                    layer
-                    for layer in self.project.adjustment_layers_for_image(source_node)
-                    if layer.operation == operation
-                ),
-                None,
-            )
-            if existing is not None:
-                self.project.update_adjustment_layer(existing.id, dict(parameters), enabled=True)
-                if self.editApplied is not None:
-                    self.editApplied()
-                return
-        node = ProcessingNode(
-            operation=f"adjustment.{operation}",
-            inputs=(source_node,),
-            parameters=dict(parameters),
-            provenance={"non_destructive": True, "renderer": "BioPic LM adjustment pipeline"},
-        )
-        self.project.graph.add_node(node)
-        order = len(self.project.adjustment_layers_for_image(source_node))
-        layer = AdjustmentLayer(
-            name=operation.replace("_", " ").title(),
-            image_node_id=source_node,
-            operation=operation,
-            parameters=dict(parameters),
-            order=order,
-            cache_key=None,
-        )
-        self.project.add_adjustment_layer(layer)
-        if self.editApplied is not None:
-            self.editApplied()
-
-    def _start_white_balance_spot_pick(self, sample_size: int) -> None:
-        self._pending_white_balance_spot_sample_size = max(3, int(sample_size))
-        self.select_tool("color_picker")
-        self._status("Click a neutral white/gray spot to set white balance.")
-
-    def _apply_white_balance_spot_from_point(self, x: int, y: int) -> None:
-        if self._current_pixels is None:
-            return
-        sample_size = max(3, int(self._pending_white_balance_spot_sample_size or 24))
-        self._pending_white_balance_spot_sample_size = None
-        image_height, image_width = self._current_pixels.shape[:2]
-        half = sample_size // 2
-        left = max(0, min(image_width - 1, int(x) - half))
-        top = max(0, min(image_height - 1, int(y) - half))
-        width = max(1, min(sample_size, image_width - left))
-        height = max(1, min(sample_size, image_height - top))
-        self.apply_named_operation(
-            "white_balance",
-            {
-                "method": "spot",
-                "sample_rect": (left, top, width, height),
-                "sample_size": sample_size,
-                "normalize": True,
-            },
-        )
-        self.select_tool("pan")
-        self._status(f"White balance sampled from {width} x {height}px spot.")
 
     def _foreground_value_changed(self, value: float) -> None:
         self._foreground_value = value
@@ -1107,88 +841,6 @@ class EditWorkspace(
         self._finish_command("drag reorder layer", before)
         self._render_current_adjustment_preview()
         self._refresh_layers()
-
-    def _status(self, message: str) -> None:
-        self.history.appendPlainText(message)
-
-    def _refresh_history(self) -> None:
-        lines = [
-            f"{node.operation}: {node.parameters}"
-            for node in self.project.graph.nodes.values()
-            if node.operation.startswith("edit.")
-        ]
-        lines.extend(
-            str(item.get("operation", "edit command"))
-            for item in self.project.history
-            if isinstance(item, dict)
-        )
-        self.history.setPlainText("\n".join(lines))
-
-    def _refresh_layers(self) -> None:
-        active_layer_id = self._current_layer_id
-        self.layers_list.clear()
-        source_node = (
-            self.project.source_node_id_for_asset(self._current_asset_id)
-            if self._current_asset_id is not None
-            else None
-        )
-        selected_row = -1
-        for layer in sorted(self.project.edit_layers.values(), key=lambda item: item.order):
-            if source_node is None or layer.source_node_id in {None, source_node}:
-                item = QListWidgetItem(_layer_label(layer))
-                icon = _layer_icon(layer)
-                if icon is not None:
-                    item.setIcon(icon)
-                item.setData(256, layer.id)
-                self.layers_list.addItem(item)
-                if layer.id == active_layer_id:
-                    selected_row = self.layers_list.count() - 1
-        if selected_row >= 0:
-            self.layers_list.setCurrentRow(selected_row)
-        if self.layers_list.count() and self.layers_list.currentRow() < 0:
-            self.layers_list.setCurrentRow(0)
-
-    def _update_current_layer_item(self, layer: EditLayer) -> None:
-        for index in range(self.layers_list.count()):
-            item = self.layers_list.item(index)
-            if str(item.data(256)) == layer.id:
-                item.setText(_layer_label(layer))
-                icon = _layer_icon(layer)
-                item.setIcon(icon if icon is not None else QIcon())
-                break
-        self.layer_opacity_spin.blockSignals(True)
-        self.layer_blend_combo.blockSignals(True)
-        self.layer_visible_check.blockSignals(True)
-        self.layer_lock_check.blockSignals(True)
-        self.layer_position_lock_check.blockSignals(True)
-        self.layer_visibility_lock_check.blockSignals(True)
-        self.layer_opacity_spin.setValue(layer.opacity * 100.0)
-        self.layer_blend_combo.setCurrentText(layer.blend_mode.value)
-        self.layer_visible_check.setChecked(layer.visible)
-        self.layer_lock_check.setChecked(layer.locked or LayerLock.PIXELS in layer.lock_flags)
-        self.layer_position_lock_check.setChecked(LayerLock.POSITION in layer.lock_flags)
-        self.layer_visibility_lock_check.setChecked(LayerLock.VISIBILITY in layer.lock_flags)
-        self.layer_opacity_spin.blockSignals(False)
-        self.layer_blend_combo.blockSignals(False)
-        self.layer_visible_check.blockSignals(False)
-        self.layer_lock_check.blockSignals(False)
-        self.layer_position_lock_check.blockSignals(False)
-        self.layer_visibility_lock_check.blockSignals(False)
-
-    def _refresh_adjustments(self) -> None:
-        self.adjustment_list.clear()
-        source_node = (
-            self.project.source_node_id_for_asset(self._current_asset_id)
-            if self._current_asset_id is not None
-            else None
-        )
-        layers = sorted(self.project.adjustment_layers.values(), key=lambda layer: layer.order)
-        for layer in layers:
-            if source_node is None or layer.image_node_id == source_node:
-                state = "on" if layer.enabled else "off"
-                item = QListWidgetItem(f"{state} | {layer.name}")
-                item.setData(256, layer.id)
-                self.adjustment_list.addItem(item)
 
     def _ensure_default_layer(self) -> None:
         if self._current_asset_id is None:

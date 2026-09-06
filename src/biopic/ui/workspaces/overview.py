@@ -104,18 +104,21 @@ class OverviewWorkspace(QWidget):
         self._add_text_category(
             "Scaled images",
             [
-                f"Calibration {node_id}: {calibration.unit_per_pixel:.6g} {calibration.unit}/px"
+                f"{self._node_display_name(node_id)}: "
+                f"{calibration.unit_per_pixel:.6g} {calibration.unit}/px"
                 for node_id, calibration in self.project.calibrations.items()
             ]
             + [
-                f"Scale bar {scale_bar.id}: {scale_bar.physical_length:g} {scale_bar.unit}"
+                f"{self._node_display_name(scale_bar.image_node_id)}: "
+                f"{scale_bar.physical_length:g} {scale_bar.unit} scale bar"
                 for scale_bar in self.project.scale_bars.values()
             ],
         )
         self._add_text_category(
             "Annotated images",
             [
-                f"{annotation.text or annotation.kind.value}: {annotation.image_node_id}"
+                f"{self._node_display_name(annotation.image_node_id)}: "
+                f"{annotation.text or annotation.kind.value}"
                 for annotation in self.project.annotations.values()
             ],
         )
@@ -157,6 +160,13 @@ class OverviewWorkspace(QWidget):
         self.content_layout.addWidget(QLabel(label))
         for entry in entries:
             self.content_layout.addWidget(QLabel(entry))
+
+    def _node_display_name(self, node_id: str) -> str:
+        node = self.project.graph.nodes.get(node_id)
+        asset_id = node.parameters.get("asset_id") if node is not None else None
+        if isinstance(asset_id, str) and asset_id in self.project.assets:
+            return project_asset_display_name(self.project.assets[asset_id], self.project.stacks)
+        return "Image"
 
     def _add_category_grid(self, label: str) -> QGridLayout:
         self.content_layout.addWidget(QLabel(label))

@@ -5,7 +5,13 @@ from __future__ import annotations
 import numpy as np
 
 from biopic.imaging.layer_buffers import layer_alpha_buffer, layer_content_buffer, set_layer_buffers
-from biopic.models.editing import EditLayer, LayerContentKind, payload_to_pixels
+from biopic.models.editing import (
+    AdjustmentLayer,
+    EditLayer,
+    LayerContentKind,
+    payload_to_pixels,
+    pixels_to_payload,
+)
 from biopic.ui.workspace_helpers.layers import (
     apply_layer_metadata as _apply_layer_metadata,
     layer_metadata as _layer_metadata,
@@ -69,9 +75,24 @@ class EditHistoryMixin:
 
     def _snapshot_edit_state(self) -> dict[str, object]:
         return {
-            "edit_layers": [layer.to_dict() for layer in self.project.edit_layers.values()],
+            "edit_layers": [
+                self._layer_snapshot_dict(layer) for layer in self.project.edit_layers.values()
+            ],
+            "adjustment_layers": [
+                layer.to_dict() for layer in self.project.adjustment_layers.values()
+            ],
             "active_edit_layers": dict(self.project.active_edit_layers),
         }
+
+    def _layer_snapshot_dict(self, layer: EditLayer) -> dict[str, object]:
+        data = layer.to_dict()
+        content = layer_content_buffer(layer.id)
+        alpha = layer_alpha_buffer(layer.id)
+        if content is not None:
+            data["content"] = pixels_to_payload(content)
+        if alpha is not None:
+            data["alpha"] = pixels_to_payload(alpha)
+        return data
 
     def _restore_edit_state(self, state: dict[str, object]) -> None:
         layers_data = state.get("edit_layers", [])
@@ -83,6 +104,14 @@ class EditHistoryMixin:
             self.project.active_edit_layers = {
                 str(key): str(value) for key, value in active_data.items()
             }
+        adjustments_data = state.get("adjustment_layers")
+        if isinstance(adjustments_data, list):
+            adjustment_layers = [
+                AdjustmentLayer.from_dict(item)
+                for item in adjustments_data
+                if isinstance(item, dict)
+            ]
+            self.project.adjustment_layers = {layer.id: layer for layer in adjustment_layers}
         self._current_layer_id = (
             self.project.active_edit_layers.get(self._current_source_node_id)
             if self._current_source_node_id is not None
@@ -93,6 +122,7 @@ class EditHistoryMixin:
         self._invalidate_edit_composite_cache()
         self._render_current_adjustment_preview()
         self._refresh_layers()
+        self._refresh_adjustments()
         self._refresh_history()
 
     def _finish_command(self, description: str, before: dict[str, object]) -> None:

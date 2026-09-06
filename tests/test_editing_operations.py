@@ -16,6 +16,11 @@ from biopic.imaging.editing import (
     _hsl_to_rgb,
     _rgb_to_hsl,
     apply_edit_operation,
+    flat_field_correction_estimated,
+    healed_uniform_background_outside_selection,
+    rotated_content_crop_rect,
+    subtract_background_estimated,
+    uniform_background_outside_selection,
 )
 from biopic.imaging.filters import gaussian_smooth, high_pass, median_filter
 from biopic.models.editing import EditLayer
@@ -52,6 +57,34 @@ def test_estimated_flat_field_recovers_smooth_shading() -> None:
     assert np.isfinite(corrected).all()
 
 
+def test_estimated_background_corrections_report_progress() -> None:
+    image = np.linspace(0, 255, 16 * 18, dtype=np.uint8).reshape(16, 18)
+    events: list[tuple[str, float]] = []
+
+    flat = flat_field_correction_estimated(
+        image,
+        sigma=2.0,
+        progress=lambda message, fraction: events.append((message, fraction)),
+    )
+
+    assert flat.shape == image.shape
+    assert events
+    assert events[0][1] == 0.04
+    assert events[-1] == ("Flat-field correction complete", 1.0)
+
+    events.clear()
+    subtracted = subtract_background_estimated(
+        image,
+        sigma=2.0,
+        progress=lambda message, fraction: events.append((message, fraction)),
+    )
+
+    assert subtracted.shape == image.shape
+    assert events
+    assert events[0][1] == 0.04
+    assert events[-1] == ("Background subtraction complete", 1.0)
+
+
 def test_levels_gamma_and_curve_preserve_dtype() -> None:
     image = np.array([0, 128, 255], dtype=np.uint8)
 
@@ -75,6 +108,77 @@ def test_high_pass_and_smoothing_filters() -> None:
     assert smoothed[4, 4] < image[4, 4]
     assert sharpened[4, 4] > smoothed[4, 4]
     assert medianed[4, 4] == 0
+
+
+def test_uniform_background_uses_global_texture_without_sampling_selection() -> None:
+    yy, xx = np.mgrid[:40, :40]
+    image = (90 + ((xx * 7 + yy * 5) % 35)).astype(np.uint8)
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[15:25, 15:25] = True
+    image[mask] = 240
+
+    result = uniform_background_outside_selection(image, mask)
+
+    assert result.dtype == image.dtype
+    assert np.array_equal(result[mask], image[mask])
+    assert 240 not in set(result[~mask].reshape(-1).tolist())
+    assert np.unique(result[~mask]).size > 8
+
+
+def test_uniform_background_reports_determinate_progress() -> None:
+    yy, xx = np.mgrid[:36, :42]
+    image = (80 + ((xx * 3 + yy * 5) % 20)).astype(np.uint8)
+    mask = np.zeros((36, 42), dtype=bool)
+    mask[12:24, 16:28] = True
+    events: list[tuple[str, float]] = []
+
+    result = uniform_background_outside_selection(
+        image,
+        mask,
+        progress=lambda message, fraction: events.append((message, fraction)),
+    )
+
+    assert result.shape == image.shape
+    assert events
+    assert events[0] == ("Preparing background mask", 0.02)
+    assert events[-1] == ("Background complete", 1.0)
+
+
+def test_uniform_background_prefers_low_contrast_clone_source() -> None:
+    image = np.zeros((48, 64), dtype=np.uint8)
+    yy, xx = np.mgrid[:48, :64]
+    image[:, :] = np.where((xx + yy) % 2 == 0, 40, 180).astype(np.uint8)
+    image[4:20, 4:20] = 104
+    image[4:20:2, 4:20:2] = 105
+    mask = np.zeros((48, 64), dtype=bool)
+    mask[20:30, 28:38] = True
+    image[mask] = 240
+
+    result = uniform_background_outside_selection(image, mask)
+
+    outside_values = result[~mask]
+    assert int(outside_values.max()) - int(outside_values.min()) <= 3
+    assert 240 not in set(outside_values.reshape(-1).tolist())
+
+
+def test_healed_uniform_background_preserves_destination_lighting() -> None:
+    yy, xx = np.mgrid[:56, :72]
+    base = 70.0 + xx.astype(np.float32) * 1.2 + yy.astype(np.float32) * 0.25
+    texture = ((xx * 3 + yy * 5) % 7).astype(np.float32) - 3.0
+    image = np.clip(base + texture, 0, 255).astype(np.uint8)
+    image[4:20, 5:25] = 92
+    image[4:20:2, 5:25:2] = 94
+    mask = np.zeros((56, 72), dtype=bool)
+    mask[20:36, 28:44] = True
+    image[mask] = 240
+
+    result = healed_uniform_background_outside_selection(image, mask)
+
+    assert result.dtype == image.dtype
+    assert np.array_equal(result[mask], image[mask])
+    assert 240 not in set(result[~mask].reshape(-1).tolist())
+    assert np.unique(result[~mask]).size > 8
+    assert float(result[:, -10:].mean()) > float(result[:, :10].mean()) + 10.0
 
 
 def test_gimp_style_hue_saturation_ranges_and_alpha() -> None:
@@ -120,6 +224,50 @@ def test_geometry_crop_and_uniform_resize() -> None:
 
     assert cropped.tolist() == [[5, 6], [9, 10]]
     assert resized.shape == (2, 2)
+
+
+def test_free_rotation_keeps_empty_regions_transparent() -> None:
+    image = np.full((20, 12, 3), 180, dtype=np.uint8)
+
+    rotated = apply_edit_operation(image, "rotate_free", {"angle": 33.0})
+
+    assert rotated.dtype == image.dtype
+    assert rotated.ndim == 3
+    assert rotated.shape[2] == 4
+    assert rotated.shape[0] > image.shape[0]
+    assert np.any(rotated[..., 3] == 0)
+
+
+def test_crop_rotated_image_uses_largest_opaque_rectangle() -> None:
+    image = np.full((8, 10, 4), 255, dtype=np.uint8)
+    image[:2, :, 3] = 0
+    image[-2:, :, 3] = 0
+    image[:, :1, 3] = 0
+    image[:, -1:, 3] = 0
+
+    rect = rotated_content_crop_rect(image)
+    cropped = apply_edit_operation(image, "crop_rotated_image", {})
+
+    assert rect == (1, 2, 8, 4)
+    assert cropped.shape == (4, 8, 4)
+    assert np.all(cropped[..., 3] == 255)
+
+
+def test_fill_rotated_background_fills_transparent_corners() -> None:
+    yy, xx = np.mgrid[:16, :18]
+    image = np.zeros((16, 18, 4), dtype=np.uint8)
+    image[..., 0] = (80 + xx * 3).astype(np.uint8)
+    image[..., 1] = (90 + yy * 2).astype(np.uint8)
+    image[..., 2] = 110
+    image[..., 3] = 255
+    image[:4, :4, 3] = 0
+    image[-4:, -4:, 3] = 0
+
+    filled = apply_edit_operation(image, "fill_rotated_background", {})
+
+    assert filled.shape == image.shape
+    assert np.all(filled[..., 3] == 255)
+    assert np.any(filled[:4, :4, :3] != 0)
 
 
 def test_edit_dispatch_and_project_round_trip(workspace_tmp_path: Path) -> None:

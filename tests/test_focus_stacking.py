@@ -1,33 +1,47 @@
+from dataclasses import replace
+from pathlib import Path
+
 import cv2
 import numpy as np
+from PIL import Image
 from scipy import ndimage
 
+from biopic.imaging.io import import_stack
 from biopic.imaging.stacking import (
     AlignmentMode,
     BackgroundMode,
     FocusMetric,
     FocusStackParameters,
+    FocusStackResult,
     StackingMethod,
     focus_stack,
 )
 from biopic.imaging.stacking.alignment import align_stack_translation
 from biopic.imaging.stacking.focus_metrics import focus_measure
+from biopic.imaging.stacking import stacker as stacker_module
 from biopic.imaging.stacking.stacker import (
     adjust_depth_regions,
     auto_orient_stack_images,
     blend_low_confidence_background,
     clean_depth_map_by_confidence,
+    custom_confidence_stack,
     custom_stack_parameters,
-    decompiled_confidence_background_composite,
-    decompiled_fixed_filter_weights,
-    decompiled_neighbor_smooth,
-    decompiled_ring_supported_confidence_cleanup,
+    reference_confidence_background_composite,
+    reference_fixed_filter_weights,
+    reference_neighbor_smooth,
+    reference_output_color_response,
+    reference_ring_supported_confidence_cleanup,
+    reference_source_buffer_image,
+    reference_stack_mode_three_working_image,
+    reference_suppression_buffer_blend,
+    incremental_reference_custom_buffers,
     preserve_specimen_detail,
     stack_focus_measure,
     stable_background_reference,
     suppress_custom_background_grain,
 )
 from biopic.models.image_asset import ImageAsset
+from biopic.models.image_stack import StackKind
 from biopic.models.project import Project
 from biopic.pipeline.node import ProcessingNode
 
@@ -173,6 +187,9 @@ def test_focus_stack_parameters_round_trip_program_style_options() -> None:
         background_mode=BackgroundMode.DARKEST,
         confidence_cleanup=False,
         use_cuda=True,
+        reverse_order=True,
+        skip_final_depth_buffer=True,
+        debug_save_stages=True,
     )
 
     restored = FocusStackParameters.from_dict(params.to_dict())
@@ -186,24 +203,30 @@ def test_focus_stack_parameters_round_trip_program_style_options() -> None:
     assert restored.background_mode is BackgroundMode.DARKEST
     assert restored.confidence_cleanup is False
     assert restored.use_cuda is True
+    assert restored.reverse_order is True
+    assert restored.skip_final_depth_buffer is True
+    assert restored.debug_save_stages is True
 
 
 def test_custom_stack_parameters_force_confidence_cleanup() -> None:
     params = custom_stack_parameters(
         FocusStackParameters(
             stacking_method=StackingMethod.CUSTOM,
-            focus_radius=3,
+            focus_radius=5,
             score_threshold=2,
             smoothing_sigma=0.25,
             adaptive_weighting=False,
-            detail_scale=4,
+            scale_preset=1,
+            detail_scale=10,
             confidence_cleanup=False,
         )
     )
 
     assert params.stacking_method is StackingMethod.CUSTOM
-    assert params.focus_radius == 2
+    assert params.focus_radius == 5
     assert params.score_threshold == 2
+    assert params.scale_preset == 1
+    assert params.detail_scale == 10
     assert params.smoothing_sigma >= 0.35
     assert params.confidence_cleanup is True
 
@@ -223,7 +246,251 @@ def test_stack_workspace_parameters_keep_full_resolution(qtbot) -> None:
     assert workspace._parameters().region_bias == -3
     assert workspace._parameters().background_mode is BackgroundMode.MEDIAN
     assert workspace._parameters().confidence_cleanup is True
+    assert workspace._parameters().reverse_order is False
     assert workspace.method_combo.findData(StackingMethod.CUSTOM.value) >= 0
+
+
+def test_stack_workspace_debug_controls_follow_options_flag(qtbot) -> None:
+    from biopic.ui.workspaces.stack import StackWorkspace
+
+    workspace = StackWorkspace(Project.new("Stack Debug Options"))
+    qtbot.addWidget(workspace)
+    custom_index = workspace.method_combo.findData(StackingMethod.CUSTOM.value)
+    if custom_index >= 0:
+        workspace.method_combo.setCurrentIndex(custom_index)
+
+    workspace.skip_final_depth_buffer_check.setChecked(True)
+    workspace.debug_save_stages_check.setChecked(True)
+    assert workspace._parameters().skip_final_depth_buffer is False
+    assert workspace._parameters().debug_save_stages is False
+    assert workspace.skip_final_depth_buffer_check.isHidden()
+    assert workspace.debug_save_stages_check.isHidden()
+    assert workspace.cuda_check.isHidden()
+    assert workspace.gpu_limit_label.isHidden()
+    assert workspace.gpu_limit_spin.isHidden()
+
+    workspace.set_debug_options_enabled(True)
+
+    if custom_index >= 0:
+        assert not workspace.skip_final_depth_buffer_check.isHidden()
+        assert not workspace.debug_save_stages_check.isHidden()
+    assert workspace._parameters().skip_final_depth_buffer is True
+    assert workspace._parameters().debug_save_stages is True
+    assert workspace.cuda_check.isHidden()
+    assert workspace.gpu_limit_label.isHidden()
+    assert workspace.gpu_limit_spin.isHidden()
+
+
+def test_stack_workspace_reverse_button_reorders_sources(
+    qtbot,
+    workspace_tmp_path: Path,
+) -> None:
+    from biopic.ui.workspaces.stack import StackWorkspace
+
+    project = Project.new("Reverse Stack Sources")
+    paths = _write_stack_images(workspace_tmp_path, "reverse-source", 3)
+    stack = import_stack(project, paths, StackKind.FOCAL)
+    original_order = list(stack.asset_ids)
+    workspace = StackWorkspace(project)
+    qtbot.addWidget(workspace)
+    workspace.refresh()
+
+    workspace.reverse_button.click()
+
+    assert project.stacks[stack.id].asset_ids == list(reversed(original_order))
+    assert [
+        str(workspace.thumbnails.item(row).data(256))
+        for row in range(workspace.thumbnails.count())
+    ] == list(reversed(original_order))
+    assert workspace._parameters().reverse_order is False
+
+
+def test_stack_workspace_delete_selected_stack_removes_stack(
+    qtbot,
+    workspace_tmp_path: Path,
+) -> None:
+    from biopic.ui.workspaces.stack import StackWorkspace
+
+    project = Project.new("Delete Stack")
+    paths = _write_stack_images(workspace_tmp_path, "delete-stack", 3)
+    stack = import_stack(project, paths, StackKind.FOCAL)
+    source_asset_ids = set(stack.asset_ids)
+    workspace = StackWorkspace(project)
+    qtbot.addWidget(workspace)
+    workspace.refresh()
+
+    workspace.stack_list.setCurrentRow(0)
+    workspace.delete_selected_stack()
+
+    assert stack.id not in project.stacks
+    assert not source_asset_ids.intersection(project.assets)
+    assert workspace._current_stack_id is None
+
+    workspace.undo()
+
+    assert stack.id in project.stacks
+    assert source_asset_ids.issubset(project.assets)
+
+    workspace.redo()
+
+    assert stack.id not in project.stacks
+
+
+def test_stack_workspace_delete_source_keeps_stack(
+    qtbot,
+    workspace_tmp_path: Path,
+) -> None:
+    from biopic.ui.workspaces.stack import StackWorkspace
+
+    project = Project.new("Delete Stack Source")
+    paths = _write_stack_images(workspace_tmp_path, "delete-source", 3)
+    stack = import_stack(project, paths, StackKind.FOCAL)
+    original_order = list(stack.asset_ids)
+    workspace = StackWorkspace(project)
+    qtbot.addWidget(workspace)
+    workspace.refresh()
+    workspace.thumbnails.setCurrentRow(0)
+
+    workspace.remove_selected_image()
+
+    assert stack.id in project.stacks
+    assert len(project.stacks[stack.id].asset_ids) == 2
+
+    workspace.undo()
+
+    assert project.stacks[stack.id].asset_ids == original_order
+
+    workspace.redo()
+
+    assert len(project.stacks[stack.id].asset_ids) == 2
+
+
+def test_stack_workspace_remove_selected_sources_removes_multiple_with_undo(
+    qtbot,
+    workspace_tmp_path: Path,
+) -> None:
+    from biopic.ui.workspaces.stack import StackWorkspace
+
+    project = Project.new("Delete Multiple Sources")
+    paths = _write_stack_images(workspace_tmp_path, "delete-multiple", 4)
+    stack = import_stack(project, paths, StackKind.FOCAL)
+    original_order = list(stack.asset_ids)
+    workspace = StackWorkspace(project)
+    qtbot.addWidget(workspace)
+    workspace.refresh()
+    workspace.thumbnails.item(1).setSelected(True)
+    workspace.thumbnails.item(3).setSelected(True)
+
+    workspace.remove_selected_image()
+
+    assert project.stacks[stack.id].asset_ids == [original_order[0], original_order[2]]
+
+    workspace.undo()
+
+    assert project.stacks[stack.id].asset_ids == original_order
+
+    workspace.redo()
+
+    assert project.stacks[stack.id].asset_ids == [original_order[0], original_order[2]]
+
+
+def test_stack_workspace_remove_image_does_not_delete_stack_when_stack_list_focused(
+    qtbot,
+    workspace_tmp_path: Path,
+) -> None:
+    from biopic.ui.workspaces.stack import StackWorkspace
+
+    project = Project.new("Remove Source Not Stack")
+    paths = _write_stack_images(workspace_tmp_path, "remove-source-not-stack", 3)
+    stack = import_stack(project, paths, StackKind.FOCAL)
+    workspace = StackWorkspace(project)
+    qtbot.addWidget(workspace)
+    workspace.refresh()
+    workspace.stack_list.setFocus()
+    workspace.stack_list.setCurrentRow(0)
+
+    workspace.remove_selected_image()
+
+    assert stack.id in project.stacks
+    assert len(project.stacks[stack.id].asset_ids) == 3
+
+
+def test_stack_workspace_uses_bounded_source_preview(
+    qtbot,
+    workspace_tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from biopic.ui.workspaces import stack as stack_workspace_module
+    from biopic.ui.workspaces.stack import StackWorkspace
+
+    project = Project.new("Stack Source Preview")
+    paths = _write_stack_images(workspace_tmp_path, "preview-source", 2)
+    stack = import_stack(project, paths, StackKind.FOCAL)
+    workspace = StackWorkspace(project)
+    qtbot.addWidget(workspace)
+    calls: list[str] = []
+
+    def fake_preview(asset: ImageAsset) -> np.ndarray:
+        calls.append(asset.id)
+        return np.zeros((6, 8, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(stack_workspace_module, "asset_preview_pixels", fake_preview)
+
+    workspace.refresh()
+
+    assert calls
+    assert workspace.source_canvas._pixels is not None
+    assert workspace.source_canvas._pixels.shape[:2] == (6, 8)
+    assert calls[-1] in stack.asset_ids
+
+
+def test_stack_workspace_refresh_preserves_skip_final_preview(
+    qtbot,
+    workspace_tmp_path: Path,
+) -> None:
+    from biopic.ui.workspaces.stack import StackWorkspace
+
+    project = Project.new("Skip Final Preview")
+    paths = _write_stack_images(workspace_tmp_path, "skip-final-preview", 2)
+    stack = import_stack(project, paths, StackKind.FOCAL)
+    workspace = StackWorkspace(project)
+    qtbot.addWidget(workspace)
+    workspace.refresh()
+    workspace._running_stack_id = stack.id
+    workspace._current_stack_id = stack.id
+    preview = np.full((8, 8, 3), 0.75, dtype=np.float32)
+    final = np.full((8, 8, 3), 0.25, dtype=np.float32)
+    params = FocusStackParameters(
+        stacking_method=StackingMethod.CUSTOM,
+        alignment_mode=AlignmentMode.NONE,
+        skip_final_depth_buffer=True,
+    )
+
+    workspace._show_stack_preview(preview, "Stacking frame 2/2")
+    workspace._stack_finished(
+        FocusStackResult(
+            image=final,
+            depth_map=np.zeros((8, 8), dtype=np.uint16),
+            focus_map=np.zeros((8, 8), dtype=np.float32),
+            weights=np.empty((0, 8, 8), dtype=np.float32),
+            transforms=[],
+            parameters=params,
+        )
+    )
+    workspace.refresh()
+
+    assert workspace.result_canvas._pixels is not None
+    assert np.allclose(workspace.result_canvas._pixels, preview)
+    assert np.allclose(workspace._stack_results[stack.id], final)
+
+
+def _write_stack_images(root: Path, prefix: str, count: int) -> list[Path]:
+    paths: list[Path] = []
+    for index in range(count):
+        path = root / f"{prefix}-{index}.png"
+        Image.fromarray(np.full((8, 8), index, dtype=np.uint8)).save(path)
+        paths.append(path)
+    return paths
 
 
 def test_region_bias_can_grow_depth_regions() -> None:
@@ -237,6 +504,24 @@ def test_region_bias_can_grow_depth_regions() -> None:
     adjusted = adjust_depth_regions(depth, scores, 1)
 
     assert np.count_nonzero(adjusted == 1) > 1
+
+
+def test_reverse_order_controls_custom_incremental_tie_break() -> None:
+    first = np.full((12, 12), 0.2, dtype=np.float32)
+    second = np.full((12, 12), 0.8, dtype=np.float32)
+    params = FocusStackParameters(
+        stacking_method=StackingMethod.CUSTOM,
+        alignment_mode=AlignmentMode.NONE,
+        adaptive_weighting=False,
+        detail_scale=1,
+        score_threshold=0,
+    )
+
+    normal = focus_stack([first, second], params)
+    reversed_result = focus_stack([first, second], replace(params, reverse_order=True))
+
+    assert np.allclose(normal.image, first)
+    assert np.allclose(reversed_result.image, second)
 
 
 def test_confidence_cleanup_replaces_unsupported_depth_island() -> None:
@@ -259,7 +544,7 @@ def test_confidence_cleanup_replaces_unsupported_depth_island() -> None:
     assert cleaned[5, 5] == 0
 
 
-def test_decompiled_ring_cleanup_uses_sparse_neighbor_support() -> None:
+def test_reference_ring_cleanup_uses_sparse_neighbor_support() -> None:
     confidence = np.zeros((25, 25), dtype=np.float32)
     depth = np.zeros((25, 25), dtype=np.uint16)
     confidence[10, 12] = 0.2
@@ -267,7 +552,7 @@ def test_decompiled_ring_cleanup_uses_sparse_neighbor_support() -> None:
     depth[10, 12] = 2
     depth[12, 14] = 4
 
-    cleaned_confidence, cleaned_depth = decompiled_ring_supported_confidence_cleanup(
+    cleaned_confidence, cleaned_depth = reference_ring_supported_confidence_cleanup(
         confidence,
         depth,
         score_threshold=2,
@@ -278,12 +563,12 @@ def test_decompiled_ring_cleanup_uses_sparse_neighbor_support() -> None:
     assert cleaned_confidence[3, 3] == 0.0
 
 
-def test_decompiled_confidence_background_composite_uses_score_formula() -> None:
+def test_reference_confidence_background_composite_uses_score_formula() -> None:
     image = np.full((2, 2), 0.8, dtype=np.float32)
     background = np.full((2, 2), 0.2, dtype=np.float32)
     confidence = np.array([[0.0, 3 / 255], [6 / 255, 1.0]], dtype=np.float32)
 
-    composited = decompiled_confidence_background_composite(
+    composited = reference_confidence_background_composite(
         image,
         background,
         confidence,
@@ -296,14 +581,125 @@ def test_decompiled_confidence_background_composite_uses_score_formula() -> None
     assert np.isclose(composited[1, 1], 0.8)
 
 
-def test_decompiled_fixed_filter_weights_match_inferred_table() -> None:
-    assert decompiled_fixed_filter_weights(1) == (255, 0, 0)
-    assert decompiled_fixed_filter_weights(4) == (64, 191, 0)
-    assert decompiled_fixed_filter_weights(6) == (90, 115, 50)
-    assert decompiled_fixed_filter_weights(10) == (0, 0, 255)
+def test_reference_suppression_buffer_blend_uses_score_percent() -> None:
+    image = np.full((2, 2), 0.4, dtype=np.float32)
+    support = np.full((2, 2), 0.9, dtype=np.float32)
+
+    blended = reference_suppression_buffer_blend(image, support, score_threshold=20)
+
+    assert np.allclose(blended, 0.5)
 
 
-def test_decompiled_neighbor_smooth_excludes_center() -> None:
+def test_reference_support_buffer_processes_frames_from_end(monkeypatch) -> None:
+    images = [
+        np.ones((6, 6), dtype=np.float32),
+        np.zeros((6, 6), dtype=np.float32),
+    ]
+    calls = {"count": 0}
+
+    def fake_score_channels(*_args, **_kwargs):
+        calls["count"] += 1
+        value = 0.5 if calls["count"] == 1 else 0.3
+        return np.full((3, 6, 6), value, dtype=np.float32)
+
+    monkeypatch.setattr(
+        stacker_module,
+        "reference_focus_score_channels",
+        fake_score_channels,
+    )
+
+    params = FocusStackParameters(score_threshold=2)
+    (
+        _depth,
+        _confidence,
+        _buffers,
+        _confidence_buffers,
+        _id_buffers,
+        _background,
+        support_image,
+        _support_id,
+        _last_progressive,
+    ) = incremental_reference_custom_buffers(images, params, progress=None, preview=None)
+
+    assert np.allclose(support_image, 0.0)
+
+
+def test_reference_fixed_filter_weights_match_inferred_table() -> None:
+    assert reference_fixed_filter_weights(1) == (255, 0, 0)
+    assert reference_fixed_filter_weights(4) == (64, 191, 0)
+    assert reference_fixed_filter_weights(6) == (90, 115, 50)
+    assert reference_fixed_filter_weights(10) == (0, 0, 255)
+
+
+def test_reference_source_buffer_image_uses_byte_precision() -> None:
+    image = np.array([[0.0, 0.1234, 0.5, 1.0]], dtype=np.float32)
+
+    quantized = reference_source_buffer_image(image)
+
+    assert np.allclose(quantized * 255.0, np.rint(image * 255.0))
+
+
+def test_reference_stack_mode_three_working_image_averages_two_by_two() -> None:
+    image = np.arange(4 * 4, dtype=np.float32).reshape(4, 4) / 255.0
+
+    working = reference_stack_mode_three_working_image(image)
+
+    assert working.shape == (2, 2)
+    assert np.allclose(working[0, 0] * 255.0, 3.0)
+
+
+def test_reference_working_scores_expand_by_integer_index() -> None:
+    scores = np.array([[[1, 2], [3, 4]]], dtype=np.float32) / 255.0
+
+    expanded = stacker_module._expand_reference_working_scores(scores, (4, 4))
+
+    assert np.allclose(
+        expanded[0] * 255.0,
+        np.array(
+            [
+                [1, 1, 2, 2],
+                [1, 1, 2, 2],
+                [3, 3, 4, 4],
+                [3, 3, 4, 4],
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+
+def test_reference_score_channel_resize_uses_integer_grid() -> None:
+    image = np.array([[0, 20], [40, 80]], dtype=np.float32) / 255.0
+
+    resized = stacker_module._resize_reference_score_channel(image, (4, 4), 2)
+
+    assert np.allclose(resized[1, 1] * 255.0, 35.0)
+    assert np.allclose(resized[2, 2] * 255.0, 80.0)
+
+
+def test_reference_smooth_and_detail_only_overwrites_interior() -> None:
+    image = np.zeros((5, 5), dtype=np.float32)
+    image[0, :] = 0.5
+    image[:, 0] = 0.25
+    image[2, 2] = 1.0
+
+    smooth, detail = stacker_module.reference_smooth_and_detail(image)
+
+    assert np.allclose(smooth[0, :] * 255.0, np.rint(image[0, :] * 255.0))
+    assert np.allclose(detail[:, 0] * 255.0, np.rint(image[:, 0] * 255.0))
+    assert not np.isclose(smooth[2, 2], image[2, 2])
+
+
+def test_reference_detail_support_score_only_writes_interior() -> None:
+    detail = np.ones((5, 5), dtype=np.float32)
+
+    score = stacker_module.reference_detail_support_score(detail, 0)
+
+    assert np.all(score[0, :] == 0.0)
+    assert np.all(score[:, 0] == 0.0)
+    assert score[2, 2] > 0.0
+
+
+def test_reference_neighbor_smooth_excludes_center() -> None:
     image = np.zeros((5, 5), dtype=np.float32)
     image[2, 2] = 1.0
     image[1, 2] = 4.0
@@ -315,7 +711,7 @@ def test_decompiled_neighbor_smooth_excludes_center() -> None:
     image[3, 1] = 3.0
     image[3, 3] = 3.0
 
-    smoothed = decompiled_neighbor_smooth(image)
+    smoothed = reference_neighbor_smooth(image)
 
     assert np.isclose(smoothed[2, 2], (4 * 4 * 4 + 4 * 3 * 3) / 28)
 
@@ -487,6 +883,54 @@ def test_custom_stack_keeps_focused_source_contrast() -> None:
 
     assert float(np.std(result.image[18:38, 12:28])) > 0.35
     assert float(np.std(result.image[18:38, 36:52])) > 0.35
+
+
+def test_custom_skip_final_depth_buffer_returns_incremental_buffer() -> None:
+    first = np.zeros((24, 28, 3), dtype=np.float32)
+    second = first.copy()
+    first[:, :14, :] = _stripe_pattern(24, 14)[..., None]
+    second[:, 14:, :] = _stripe_pattern(24, 14)[..., None]
+    params = custom_stack_parameters(
+        FocusStackParameters(
+            stacking_method=StackingMethod.CUSTOM,
+            alignment_mode=AlignmentMode.NONE,
+            adaptive_weighting=False,
+            skip_final_depth_buffer=True,
+        )
+    )
+    progress_messages: list[str] = []
+    previews: list[np.ndarray] = []
+
+    result = custom_confidence_stack(
+        [first, second],
+        params,
+        progress=lambda message, _fraction: progress_messages.append(message),
+        preview=lambda image, _label: previews.append(image),
+    )
+    (
+        _depth,
+        _confidence,
+        _buffers,
+        _confidence_buffers,
+        _id_buffers,
+        _background,
+        _support,
+        _support_id,
+        last_progressive,
+    ) = (
+        incremental_reference_custom_buffers(
+            [reference_source_buffer_image(first), reference_source_buffer_image(second)],
+            params,
+            progress=None,
+            preview=None,
+        )
+    )
+
+    expected = last_progressive
+    assert np.allclose(result.image, expected)
+    assert previews
+    assert np.allclose(previews[-1], result.image)
+    assert "depth map" not in progress_messages
 
 
 def test_pyramid_max_contrast_depth_map_tracks_focus_regions() -> None:

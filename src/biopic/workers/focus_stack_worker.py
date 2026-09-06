@@ -6,8 +6,13 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QThread, Signal
 
-from biopic.imaging.io import load_asset_pixels
-from biopic.imaging.stacking import FocusStackParameters, FocusStackResult, focus_stack
+from biopic.imaging.io import RAW_DECODE_RAWPY, RAW_DECODE_WIC_DISPLAY, load_asset_pixels
+from biopic.imaging.stacking import (
+    FocusStackParameters,
+    FocusStackResult,
+    StackingMethod,
+    focus_stack,
+)
 from biopic.models.image_asset import ImageAsset
 
 
@@ -43,7 +48,16 @@ class FocusStackWorker(QThread):
                 self.stackFailed.emit("Stacking cancelled.")
                 return
             self.progressChanged.emit("Loading images", 0.0)
-            images = [load_asset_pixels(asset) for asset in self.job.assets]
+            raw_decode_mode = (
+                RAW_DECODE_WIC_DISPLAY
+                if self.job.parameters.stacking_method
+                in {StackingMethod.CUSTOM, StackingMethod.CUSTOM2}
+                else RAW_DECODE_RAWPY
+            )
+            images = [
+                load_asset_pixels(asset, raw_decode_mode=raw_decode_mode)
+                for asset in self.job.assets
+            ]
             if self._cancel_requested:
                 self.stackFailed.emit("Stacking cancelled.")
                 return

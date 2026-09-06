@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from biopic.imaging.io import file_checksum, write_image_metadata
 from biopic.imaging.project_render import editable_assets
 from biopic.models.image_asset import ImageAsset
 from biopic.models.project import Project
@@ -468,6 +470,15 @@ class MetadataWorkspace(QWidget):
         if metadata == asset.metadata:
             return
         asset.metadata = metadata
+        self._write_metadata_to_image_file(asset)
         self.project.touch()
         if self.metadataChanged is not None:
             self.metadataChanged()
+
+    def _write_metadata_to_image_file(self, asset: ImageAsset) -> None:
+        path = Path(asset.path)
+        try:
+            if write_image_metadata(path, asset.metadata):
+                asset.checksum = file_checksum(path)
+        except (OSError, TypeError, ValueError):
+            return

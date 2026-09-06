@@ -15,12 +15,28 @@ QMenu::item {
     background: transparent;
     padding: 4px 24px 4px 18px;
 }
+QMenu::item:checked {
+    color: palette(text);
+    background: palette(alternate-base);
+}
 QMenu::item:disabled {
     color: palette(mid);
 }
 QMenu::item:selected {
     color: palette(highlighted-text);
     background: palette(highlight);
+}
+QMenu::item:disabled:selected {
+    color: palette(mid);
+    background: palette(base);
+}
+QMenu::indicator {
+    width: 12px;
+    height: 12px;
+}
+QMenu::indicator:checked {
+    background: palette(highlight);
+    border: 1px solid palette(dark);
 }
 QGroupBox {
     border: 1px solid palette(dark);
@@ -89,5 +105,17 @@ QMenu::separator {
     height: 1px;
     background: palette(mid);
     margin: 4px 8px;
+}
+QTableWidget::item {
+    background: palette(base);
+    color: palette(text);
+}
+QTableWidget::item:selected {
+    background: palette(highlight);
+    color: palette(highlighted-text);
+}
+QToolButton::menu-indicator {
+    image: none;
+    width: 0px;
 }
 """

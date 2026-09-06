@@ -67,7 +67,7 @@ class MagnificationScale:
     distance_pixels: float
     known_distance: float
     unit: str = "μm"
-    fluid: str = "Water"
+    fluid: str = "Air"
     unit_per_pixel: float | None = None
     objective: str = ""
     imaging_method: str = ""
@@ -102,7 +102,7 @@ class MagnificationScale:
         )
 
     def menu_label(self) -> str:
-        """Return menu label such as `40x (Water)`."""
+        """Return menu label such as `40x (Air)`."""
         value = int(self.magnification) if self.magnification.is_integer() else self.magnification
         return f"{value}x ({self.fluid})"
 
@@ -125,7 +125,7 @@ class MagnificationScale:
         """Deserialize the scale row."""
         return cls(
             magnification=parse_magnification(data["magnification"]),
-            fluid=str(data.get("fluid", "Water")),
+            fluid=str(data.get("fluid", "Air")),
             distance_pixels=float(data["distance_pixels"]),
             known_distance=float(data["known_distance"]),
             unit=normalize_unit(str(data.get("unit", "μm"))),
@@ -197,6 +197,6 @@ def parse_magnification(value: object) -> float:
 def normalize_unit(unit: str) -> str:
     """Normalize common unit spellings for display and storage."""
     text = unit.strip()
-    if text in {"um", "µm"}:
+    if text in {"um", "µm", "μm"}:
         return "μm"
     return text

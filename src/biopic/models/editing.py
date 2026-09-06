@@ -184,6 +184,8 @@ class EditLayer:
     tile_store_id: str = field(default_factory=lambda: str(uuid4()))
     graph_node_id: str = field(default_factory=lambda: str(uuid4()))
     generation: int = 0
+    filter_operation: str | None = None
+    filter_parameters: dict[str, Any] = field(default_factory=dict)
     content: dict[str, Any] | None = None
     alpha: dict[str, Any] | None = None
     id: str = field(default_factory=lambda: str(uuid4()))
@@ -260,6 +262,8 @@ class EditLayer:
             "tile_store_id": self.tile_store_id,
             "graph_node_id": self.graph_node_id,
             "generation": self.generation,
+            "filter_operation": self.filter_operation,
+            "filter_parameters": self.filter_parameters,
             "content": self.content,
             "alpha": self.alpha,
         }
@@ -299,6 +303,12 @@ class EditLayer:
             tile_store_id=str(data.get("tile_store_id", data["id"])),
             graph_node_id=str(data.get("graph_node_id", data["id"])),
             generation=int(data.get("generation", 0)),
+            filter_operation=(
+                str(data["filter_operation"])
+                if data.get("filter_operation") is not None
+                else None
+            ),
+            filter_parameters=dict(data.get("filter_parameters", {})),
             content=data.get("content"),
             alpha=data.get("alpha"),
         )

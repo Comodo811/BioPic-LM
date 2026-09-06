@@ -2,7 +2,7 @@
 
 Implemented:
 
-- Independent focus-stacking code derived from documented algorithms, not copied from `decomp.txt`.
+- Independent focus-stacking code derived from documented algorithms.
 - Translation alignment with phase correlation.
 - Focus metrics:
   - Laplacian magnitude
@@ -19,7 +19,7 @@ Implemented:
 - Result display in the lower-right stack pane.
 - Focus-stack processing nodes linked to imported source-image nodes with transform provenance.
 
-Reference behavior from `decomp.txt` preserved:
+Reference behavior preserved:
 
 - Explicit Stacking and Alignment concepts.
 - Optional alignment before stacking.

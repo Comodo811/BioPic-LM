@@ -123,6 +123,12 @@ class EditSelectionMixin:
             if self._selection_coverage.shape == self._current_pixels.shape[:2]:
                 return self._selection_coverage
             self._selection_coverage = None
+        document_coverage = self._document_selection_coverage()
+        if document_coverage is not None:
+            self._selection_coverage = document_coverage
+            self._selection_rect = _coverage_bounds(document_coverage)
+            self._selection_shape = "mask"
+            return document_coverage
         if self._selection_rect is None:
             return None
         return self._rasterize_selection_shape(
@@ -130,6 +136,21 @@ class EditSelectionMixin:
             self._selection_rect,
             self._selection_polygon,
         )
+
+    def _document_selection_coverage(self) -> np.ndarray | None:
+        """Return the persisted document selection for the active image, if any."""
+        if self._current_source_node_id is None or self._current_pixels is None:
+            return None
+        expected_shape = self._current_pixels.shape[:2]
+        for selection in self.project.selections.values():
+            if selection.source_node_id != self._current_source_node_id:
+                continue
+            coverage = selection.coverage_pixels()
+            if coverage is None or coverage.shape != expected_shape:
+                continue
+            self._selection_revision = int(selection.revision)
+            return np.clip(coverage.astype(np.float32, copy=False), 0.0, 1.0)
+        return None
 
     def _rasterize_selection_shape(
         self,
@@ -214,13 +235,16 @@ class EditSelectionMixin:
         image_shape = self._current_pixels.shape[:2]
         options = self._selection_options
         feather = options.feather_radius_px if options.feather else 0.0
-        region = selection_shape_region(
-            image_shape,
-            shape,
-            rect,
-            polygon,
-            antialias=options.antialias,
-            feather_radius_px=feather,
+        region = self._run_with_progress(
+            "Creating selection...",
+            lambda: selection_shape_region(
+                image_shape,
+                shape,
+                rect,
+                polygon,
+                antialias=options.antialias,
+                feather_radius_px=feather,
+            ),
         )
         if region is None:
             return
@@ -249,11 +273,14 @@ class EditSelectionMixin:
         """Select a contiguous region with similar rendered color."""
         if self._current_pixels is None:
             return
-        region = _fuzzy_selection_region(
-            self._current_pixels,
-            x,
-            y,
-            tolerance=max(0.0, float(self.primary_spin.value())),
+        region = self._run_with_progress(
+            "Creating fuzzy selection...",
+            lambda: _fuzzy_selection_region(
+                self._current_pixels,
+                x,
+                y,
+                tolerance=max(0.0, float(self.primary_spin.value())),
+            ),
         )
         if region is None:
             return

@@ -243,7 +243,7 @@ class MeasureScaleBarsMixin:
         pixels = self.canvas._pixels
         if pixels is None:
             return (24.0, 24.0)
-        return (max(1.0, pixels.shape[1] * 0.03), max(1.0, pixels.shape[0] * 0.06))
+        return (max(1.0, pixels.shape[1] * 0.02), max(1.0, pixels.shape[0] * 0.02))
 
     def _scale_bar_offset_basis(self) -> tuple[float, float]:
         pixels = self.canvas._pixels

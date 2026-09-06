@@ -61,10 +61,33 @@ class ProcessingGraph:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ProcessingGraph:
-        """Deserialize the graph."""
+        """Deserialize the graph.
+
+        Saved projects can contain legacy graph nodes whose input references point to
+        nodes that are no longer present in the manifest. Loading should preserve the
+        recoverable project state instead of failing the whole document. Runtime graph
+        mutation remains strict through add_node().
+        """
         graph = cls()
-        for node_data in data.get("nodes", []):
-            graph.add_node(ProcessingNode.from_dict(node_data))
+        nodes = [
+            ProcessingNode.from_dict(node_data)
+            for node_data in data.get("nodes", [])
+            if isinstance(node_data, dict)
+        ]
+        node_ids = {node.id for node in nodes}
+        for node in nodes:
+            missing_inputs = tuple(input_id for input_id in node.inputs if input_id not in node_ids)
+            if missing_inputs:
+                node.inputs = tuple(input_id for input_id in node.inputs if input_id in node_ids)
+                node.status = NodeStatus.STALE
+                node.cache_key = None
+                node.provenance = {
+                    **node.provenance,
+                    "legacy_missing_inputs_removed": list(missing_inputs),
+                }
+            graph.nodes[node.id] = node
+        if graph._has_cycle():
+            graph._break_cycles()
         return graph
 
     def _has_cycle(self) -> bool:
@@ -85,3 +108,38 @@ class ProcessingGraph:
             return False
 
         return any(visit(node_id) for node_id in self.nodes)
+
+    def _break_cycles(self) -> None:
+        """Remove legacy dependency edges that form cycles during project loading."""
+        safe_inputs: dict[str, list[str]] = {node_id: [] for node_id in self.nodes}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(node_id: str) -> None:
+            if node_id in visited:
+                return
+            visiting.add(node_id)
+            node = self.nodes[node_id]
+            removed: list[str] = []
+            for input_id in node.inputs:
+                if input_id not in self.nodes:
+                    removed.append(input_id)
+                    continue
+                if input_id in visiting:
+                    removed.append(input_id)
+                    continue
+                visit(input_id)
+                safe_inputs[node_id].append(input_id)
+            visiting.remove(node_id)
+            visited.add(node_id)
+            if removed:
+                node.inputs = tuple(safe_inputs[node_id])
+                node.status = NodeStatus.STALE
+                node.cache_key = None
+                node.provenance = {
+                    **node.provenance,
+                    "legacy_cycle_inputs_removed": removed,
+                }
+
+        for node_id in list(self.nodes):
+            visit(node_id)

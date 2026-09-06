@@ -3,14 +3,34 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
 import numpy as np
 import tifffile
-from PIL import Image
+from PIL import Image, ImageOps
 
+from biopic.imaging.io_metadata import (
+    BIOPIC_METADATA_KEY,
+    _clean_metadata,
+    _embedded_metadata_from_text,
+    _tiff_resolution,
+    _write_png_metadata,
+    _write_tiff_metadata,
+    export_metadata_payload,
+    image_metadata_text,
+    image_metadata_tiff_extratags,
+    image_metadata_xmp,
+    rembi_metadata,
+)
+from biopic.imaging.io_raw import (
+    RAW_DECODE_RAWPY,
+    RAW_DECODE_WIC_DISPLAY,
+    RAW_STACK_BRIGHTNESS,
+    _decode_wic_32bpp_bgra,
+    _read_raw,
+)
 from biopic.models.image_asset import ImageAsset, ImageAssetKind
 from biopic.models.image_stack import ImageStack, StackKind
 from biopic.models.project import Project
@@ -48,8 +68,6 @@ RAW_EXTENSIONS = {
     ".x3f",
 }
 SUPPORTED_EXTENSIONS = TIFF_EXTENSIONS | RAW_EXTENSIONS | {".png", ".jpg", ".jpeg", ".bmp"}
-
-
 @dataclass(frozen=True, slots=True)
 class ImageReadResult:
     """Loaded image pixels plus the project asset record."""
@@ -58,7 +76,12 @@ class ImageReadResult:
     pixels: np.ndarray
 
 
-def read_image_asset(path: Path, *, load_pixels: bool = False) -> ImageReadResult:
+def read_image_asset(
+    path: Path,
+    *,
+    load_pixels: bool = False,
+    raw_decode_mode: str = RAW_DECODE_RAWPY,
+) -> ImageReadResult:
     """Read metadata and optionally pixels from a supported image file."""
     if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
         raise ValueError(f"Unsupported image format: {path.suffix}")
@@ -69,7 +92,7 @@ def read_image_asset(path: Path, *, load_pixels: bool = False) -> ImageReadResul
     if suffix in TIFF_EXTENSIONS:
         asset, pixels = _read_tiff(path, load_pixels)
     elif suffix in RAW_EXTENSIONS:
-        asset, pixels = _read_raw(path, load_pixels)
+        asset, pixels = _read_raw(path, load_pixels, decode_mode=raw_decode_mode)
     else:
         asset, pixels = _read_pillow(path, load_pixels)
     asset.checksum = file_checksum(path)
@@ -81,22 +104,35 @@ def import_images(
     paths: list[Path],
     *,
     kind: ImageAssetKind = ImageAssetKind.DIRECT_IMPORT,
+    progress: Callable[[int, int, Path], None] | None = None,
 ) -> list[ImageAsset]:
     """Import paths as independent source images."""
     assets: list[ImageAsset] = []
-    for path in paths:
+    total = len(paths)
+    for index, path in enumerate(paths, start=1):
         result = read_image_asset(path, load_pixels=False)
         result.asset.kind = kind
         project.add_asset(result.asset)
         assets.append(result.asset)
+        if progress is not None:
+            progress(index, total, path)
     return assets
 
 
 def import_stack(
-    project: Project, paths: list[Path], kind: StackKind = StackKind.FOCAL
+    project: Project,
+    paths: list[Path],
+    kind: StackKind = StackKind.FOCAL,
+    *,
+    progress: Callable[[int, int, Path], None] | None = None,
 ) -> ImageStack:
     """Import paths as an ordered microscopy stack."""
-    assets = import_images(project, paths, kind=ImageAssetKind.STACK_SOURCE)
+    assets = import_images(
+        project,
+        paths,
+        kind=ImageAssetKind.STACK_SOURCE,
+        progress=progress,
+    )
     stack = ImageStack(
         asset_ids=[asset.id for asset in assets],
         kind=kind,
@@ -106,9 +142,38 @@ def import_stack(
     return stack
 
 
-def load_asset_pixels(asset: ImageAsset) -> np.ndarray:
+def load_asset_pixels(
+    asset: ImageAsset,
+    *,
+    raw_decode_mode: str = RAW_DECODE_RAWPY,
+) -> np.ndarray:
     """Load an asset's pixels from its original path."""
-    return read_image_asset(Path(asset.path), load_pixels=True).pixels
+    return read_image_asset(
+        Path(asset.path),
+        load_pixels=True,
+        raw_decode_mode=raw_decode_mode,
+    ).pixels
+
+
+def write_image_metadata(path: Path, metadata: dict[str, Any]) -> bool:
+    """Embed BioPic metadata into a supported image file without changing pixel values.
+
+    TIFF and PNG can be rewritten losslessly with text metadata. Existing JPEG files are
+    intentionally not rewritten here because Pillow would re-encode the image data.
+    """
+    suffix = path.suffix.lower()
+    if not path.exists() or suffix in RAW_EXTENSIONS:
+        return False
+    clean = export_metadata_payload(metadata)
+    if not clean:
+        return False
+    if suffix in TIFF_EXTENSIONS:
+        _write_tiff_metadata(path, clean)
+        return True
+    if suffix == ".png":
+        _write_png_metadata(path, clean)
+        return True
+    return False
 
 
 def file_checksum(path: Path, algorithm: str = "sha256") -> str:
@@ -133,6 +198,7 @@ def _read_tiff(path: Path, load_pixels: bool) -> tuple[ImageAsset, np.ndarray]:
         description = getattr(first_page, "description", None)
         if description:
             metadata["image_description"] = str(description)
+            metadata.update(_embedded_metadata_from_text(str(description)))
         resolution = _tiff_resolution(first_page)
         if resolution:
             metadata.update(resolution)
@@ -162,63 +228,21 @@ def _read_tiff_pixels(path: Path) -> np.ndarray:
         with tifffile.TiffFile(path) as tif:
             return tif.asarray()
 
-
-def _read_raw(path: Path, load_pixels: bool) -> tuple[ImageAsset, np.ndarray]:
-    try:
-        import rawpy  # type: ignore[import-untyped]
-    except ImportError as exc:
-        message = (
-            "RAW image support requires optional dependency rawpy; "
-            "install BioPic LM with the raw extra."
-        )
-        raise ValueError(message) from exc
-
-    with rawpy.imread(str(path)) as raw:
-        sizes = raw.sizes
-        metadata = _clean_metadata(
-            {
-                "raw_type": type(raw).__name__,
-                "black_level_per_channel": tuple(getattr(raw, "black_level_per_channel", ())),
-                "camera_whitebalance": tuple(getattr(raw, "camera_whitebalance", ())),
-                "daylight_whitebalance": tuple(getattr(raw, "daylight_whitebalance", ())),
-                "white_level": getattr(raw, "white_level", None),
-            }
-        )
-        if load_pixels:
-            pixels = raw.postprocess(
-                output_bps=16,
-                no_auto_bright=True,
-                use_camera_wb=True,
-            )
-        else:
-            pixels = np.empty((0,), dtype=np.uint16)
-    return (
-        ImageAsset(
-            path=str(path),
-            width=int(sizes.width),
-            height=int(sizes.height),
-            frames=1,
-            dtype="uint16",
-            color_model="rgb",
-            metadata=metadata,
-        ),
-        pixels,
-    )
-
-
 def _read_pillow(path: Path, load_pixels: bool) -> tuple[ImageAsset, np.ndarray]:
     with Image.open(path) as image:
         metadata = _clean_metadata(dict(image.info))
+        metadata.update(_embedded_metadata_from_text(str(metadata.get(BIOPIC_METADATA_KEY, ""))))
         frames = getattr(image, "n_frames", 1)
-        dtype = _pillow_dtype(image)
-        pixels = np.asarray(image) if load_pixels else np.empty((0,), dtype=np.uint8)
+        oriented = ImageOps.exif_transpose(image)
+        dtype = _pillow_dtype(oriented)
+        pixels = np.asarray(oriented) if load_pixels else np.empty((0,), dtype=np.uint8)
         asset = ImageAsset(
             path=str(path),
-            width=image.width,
-            height=image.height,
+            width=oriented.width,
+            height=oriented.height,
             frames=frames,
             dtype=dtype,
-            color_model=_pillow_color_model(image.mode),
+            color_model=_pillow_color_model(oriented.mode),
             metadata=metadata,
         )
     return asset, pixels
@@ -260,28 +284,6 @@ def _pillow_color_model(mode: str) -> str:
     if mode in {"RGB", "RGBA"}:
         return mode.lower()
     return "grayscale"
-
-
-def _clean_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    clean: dict[str, Any] = {}
-    for key, value in metadata.items():
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            clean[str(key)] = value
-        elif isinstance(value, tuple):
-            clean[str(key)] = [str(item) for item in value]
-        else:
-            clean[str(key)] = str(value)
-    return clean
-
-
-def _tiff_resolution(page: Any) -> dict[str, Any]:
-    tags = page.tags
-    result: dict[str, Any] = {}
-    for name in ("XResolution", "YResolution", "ResolutionUnit"):
-        if name in tags:
-            result[name] = str(tags[name].value)
-    return result
-
 
 def _stack_name(paths: list[Path], kind: StackKind) -> str:
     if not paths:

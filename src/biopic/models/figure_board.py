@@ -136,6 +136,9 @@ class FigurePanel:
     label_bold: bool = True
     label_italic: bool = False
     label_offset: tuple[float, float] = (0.01, 0.01)
+    fill_empty_background: bool = False
+    empty_background_path: str | None = None
+    empty_background_signature: tuple[Any, ...] | None = None
     visible: bool = True
     locked: bool = False
     annotation_layer_id: str | None = None
@@ -156,6 +159,13 @@ class FigurePanel:
             "label_bold": self.label_bold,
             "label_italic": self.label_italic,
             "label_offset": list(self.label_offset),
+            "fill_empty_background": self.fill_empty_background,
+            "empty_background_path": self.empty_background_path,
+            "empty_background_signature": (
+                list(self.empty_background_signature)
+                if self.empty_background_signature is not None
+                else None
+            ),
             "visible": self.visible,
             "locked": self.locked,
             "annotation_layer_id": self.annotation_layer_id,
@@ -188,6 +198,11 @@ class FigurePanel:
             label_bold=bool(data.get("label_bold", True)),
             label_italic=bool(data.get("label_italic", False)),
             label_offset=(label_offset_values[0], label_offset_values[1]),
+            fill_empty_background=bool(data.get("fill_empty_background", False)),
+            empty_background_path=data.get("empty_background_path"),
+            empty_background_signature=_empty_background_signature_from_data(
+                data.get("empty_background_signature")
+            ),
             visible=bool(data.get("visible", True)),
             locked=bool(data.get("locked", False)),
             annotation_layer_id=data.get("annotation_layer_id"),
@@ -217,6 +232,7 @@ class FigureBoard:
     scale_bar_use_halving: bool = True
     scale_bar_use_snap_lengths: bool = True
     scale_bar_snap_lengths: list[float] = field(default_factory=list)
+    hide_common_scale_bar_value: bool = False
     id: str = field(default_factory=lambda: str(uuid4()))
 
     @property
@@ -252,6 +268,7 @@ class FigureBoard:
             "scale_bar_use_halving": self.scale_bar_use_halving,
             "scale_bar_use_snap_lengths": self.scale_bar_use_snap_lengths,
             "scale_bar_snap_lengths": list(self.scale_bar_snap_lengths),
+            "hide_common_scale_bar_value": self.hide_common_scale_bar_value,
         }
 
     @classmethod
@@ -298,6 +315,9 @@ class FigureBoard:
             scale_bar_snap_lengths=_positive_float_list(
                 data.get("scale_bar_snap_lengths", [])
             ),
+            hide_common_scale_bar_value=bool(
+                data.get("hide_common_scale_bar_value", False)
+            ),
         )
 
 
@@ -315,6 +335,38 @@ def _positive_float_list(values: object) -> list[float]:
     return result
 
 
+def common_scale_bar_value_key(scale_bars: list[object]) -> tuple[float, str] | None:
+    """Return the repeated scale-bar value whose label should be hidden."""
+    counts: dict[tuple[float, str], int] = {}
+    for scale_bar in scale_bars:
+        if not getattr(scale_bar, "display_length", True):
+            continue
+        key = (
+            round(float(getattr(scale_bar, "physical_length", 0.0)), 9),
+            str(getattr(scale_bar, "unit", "")),
+        )
+        counts[key] = counts.get(key, 0) + 1
+    repeated = [(count, key) for key, count in counts.items() if count > 1]
+    if not repeated:
+        return None
+    repeated.sort(key=lambda item: (-item[0], item[1]))
+    return repeated[0][1]
+
+
+def _empty_background_signature_from_data(value: object) -> tuple[Any, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        return None
+    result: list[Any] = []
+    for index, item in enumerate(value):
+        if index == 1 and isinstance(item, (list, tuple)):
+            result.append(tuple(item))
+        else:
+            result.append(item)
+    return tuple(result)
+
+
 def visual_panel_order(panels: list[FigurePanel]) -> list[FigurePanel]:
     """Return panels in natural reading order by geometry."""
     return sorted(
@@ -325,6 +377,21 @@ def visual_panel_order(panels: list[FigurePanel]) -> list[FigurePanel]:
             round(panel.rect[3], 6),
             round(panel.rect[2], 6),
         ),
+    )
+
+
+def panel_empty_background_signature(
+    panel: FigurePanel,
+    width: int,
+    height: int,
+) -> tuple[Any, ...]:
+    """Return the panel state covered by a baked empty-background fill."""
+    return (
+        panel.source_node_id,
+        tuple(round(float(value), 6) for value in panel.crop),
+        round(float(panel.rotation), 6),
+        int(width),
+        int(height),
     )
 
 
@@ -446,6 +513,8 @@ def generate_layout_presets(count: int) -> list[LayoutPreset]:
     if count >= 4:
         presets.append(_large_first_layout(count, "Large right", "right"))
         presets.append(_large_first_layout(count, "Large bottom", "bottom"))
+    if count == 5:
+        presets.extend(_five_panel_split_layouts())
     return presets
 
 
@@ -514,6 +583,52 @@ def _large_first_layout(count: int, name: str, side: str) -> LayoutPreset:
         panels.extend(_row_rects(remainder, 0.0, 0.0, 1.0, 0.42))
         panels.append((0.0, 0.42, 1.0, 0.58))
     return LayoutPreset(name, panels)
+
+
+def _five_panel_split_layouts() -> list[LayoutPreset]:
+    """Return balanced two-by-three split layouts for five panels."""
+    return [
+        LayoutPreset(
+            "Two top, three bottom",
+            [
+                (0.0, 0.0, 0.5, 0.5),
+                (0.5, 0.0, 0.5, 0.5),
+                (0.0, 0.5, 1.0 / 3.0, 0.5),
+                (1.0 / 3.0, 0.5, 1.0 / 3.0, 0.5),
+                (2.0 / 3.0, 0.5, 1.0 / 3.0, 0.5),
+            ],
+        ),
+        LayoutPreset(
+            "Three top, two bottom",
+            [
+                (0.0, 0.0, 1.0 / 3.0, 0.5),
+                (1.0 / 3.0, 0.0, 1.0 / 3.0, 0.5),
+                (2.0 / 3.0, 0.0, 1.0 / 3.0, 0.5),
+                (0.0, 0.5, 0.5, 0.5),
+                (0.5, 0.5, 0.5, 0.5),
+            ],
+        ),
+        LayoutPreset(
+            "Two left, three right",
+            [
+                (0.0, 0.0, 0.5, 0.5),
+                (0.0, 0.5, 0.5, 0.5),
+                (0.5, 0.0, 0.5, 1.0 / 3.0),
+                (0.5, 1.0 / 3.0, 0.5, 1.0 / 3.0),
+                (0.5, 2.0 / 3.0, 0.5, 1.0 / 3.0),
+            ],
+        ),
+        LayoutPreset(
+            "Three left, two right",
+            [
+                (0.0, 0.0, 0.5, 1.0 / 3.0),
+                (0.0, 1.0 / 3.0, 0.5, 1.0 / 3.0),
+                (0.0, 2.0 / 3.0, 0.5, 1.0 / 3.0),
+                (0.5, 0.0, 0.5, 0.5),
+                (0.5, 0.5, 0.5, 0.5),
+            ],
+        ),
+    ]
 
 
 def _stack_rects(

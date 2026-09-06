@@ -196,10 +196,13 @@ class AnnotationObject:
             if len(point) != 2:
                 raise ValueError("annotation points must contain x and y")
             points.append((float(point[0]), float(point[1])))
+        kind = AnnotationKind(data["kind"])
+        if kind is AnnotationKind.WEDGE:
+            points = normalize_wedge_points(points)
         return cls(
             id=str(data["id"]),
             image_node_id=str(data["image_node_id"]),
-            kind=AnnotationKind(data["kind"]),
+            kind=kind,
             points=points,
             text=str(data.get("text", "")),
             definition_id=data.get("definition_id"),
@@ -214,6 +217,93 @@ class AnnotationObject:
             visible=bool(data.get("visible", True)),
             include_in_legend=bool(data.get("include_in_legend", True)),
         )
+
+
+def normalize_wedge_points(
+    points: list[tuple[float, float]],
+    *,
+    padding: float = 0.0,
+) -> list[tuple[float, float]]:
+    """Return a three-point wedge triangle constrained to normalized image bounds."""
+    if len(points) < 2:
+        return fit_points_inside_unit_square(points, padding=padding)
+    if len(points) == 2:
+        base_mid = points[0]
+        tip = points[1]
+        axis_x = float(tip[0]) - float(base_mid[0])
+        axis_y = float(tip[1]) - float(base_mid[1])
+        axis_length = max(1e-6, (axis_x * axis_x + axis_y * axis_y) ** 0.5)
+        perp_x = -axis_y / axis_length
+        perp_y = axis_x / axis_length
+        half = max(axis_length * 0.22, 0.002)
+        points = [
+            (float(tip[0]), float(tip[1])),
+            (float(base_mid[0]) - perp_x * half, float(base_mid[1]) - perp_y * half),
+            (float(base_mid[0]) + perp_x * half, float(base_mid[1]) + perp_y * half),
+        ]
+    else:
+        points = [(float(x), float(y)) for x, y in points[:3]]
+    return fit_points_inside_unit_square(points, padding=padding)
+
+
+def fit_points_inside_unit_square(
+    points: list[tuple[float, float]],
+    *,
+    padding: float = 0.0,
+) -> list[tuple[float, float]]:
+    """Fit a normalized point set into the image bounds without changing its shape."""
+    if not points:
+        return []
+    left = float(padding)
+    top = float(padding)
+    right = 1.0 - float(padding)
+    bottom = 1.0 - float(padding)
+    if right <= left or bottom <= top:
+        left = top = 0.0
+        right = bottom = 1.0
+    min_x = min(float(point[0]) for point in points)
+    max_x = max(float(point[0]) for point in points)
+    min_y = min(float(point[1]) for point in points)
+    max_y = max(float(point[1]) for point in points)
+    shape_width = max_x - min_x
+    shape_height = max_y - min_y
+    target_width = right - left
+    target_height = bottom - top
+    scale = 1.0
+    if shape_width > target_width and shape_width > 0.0:
+        scale = min(scale, target_width / shape_width)
+    if shape_height > target_height and shape_height > 0.0:
+        scale = min(scale, target_height / shape_height)
+    center_x = (min_x + max_x) / 2.0
+    center_y = (min_y + max_y) / 2.0
+    fitted = [
+        (
+            center_x + (float(point[0]) - center_x) * scale,
+            center_y + (float(point[1]) - center_y) * scale,
+        )
+        for point in points
+    ]
+    min_x = min(point[0] for point in fitted)
+    max_x = max(point[0] for point in fitted)
+    min_y = min(point[1] for point in fitted)
+    max_y = max(point[1] for point in fitted)
+    dx = 0.0
+    dy = 0.0
+    if min_x < left:
+        dx = left - min_x
+    elif max_x > right:
+        dx = right - max_x
+    if min_y < top:
+        dy = top - min_y
+    elif max_y > bottom:
+        dy = bottom - max_y
+    return [
+        (
+            max(0.0, min(1.0, point[0] + dx)),
+            max(0.0, min(1.0, point[1] + dy)),
+        )
+        for point in fitted
+    ]
 
 
 def consolidate_legend(

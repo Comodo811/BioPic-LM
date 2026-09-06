@@ -1,8 +1,10 @@
 import numpy as np
+from scipy import ndimage
 
 from biopic.imaging.editing import apply_edit_operation
 from biopic.imaging.filters import (
     deconvolve_richardson_lucy,
+    gimp_noise_reduction,
     high_pass,
     local_contrast,
     microscopy_noise_reduction,
@@ -23,6 +25,37 @@ def test_microscopy_noise_reduction_is_deterministic_and_preserves_dtype() -> No
     assert first[2, 2] < image[2, 2]
 
 
+def test_gimp_noise_reduction_strength_zero_is_passthrough() -> None:
+    image = np.arange(25, dtype=np.uint8).reshape(5, 5)
+
+    result = gimp_noise_reduction(image, strength=0)
+
+    assert result.dtype == image.dtype
+    assert np.array_equal(result, image)
+
+
+def test_gimp_noise_reduction_strength_controls_iterations() -> None:
+    image = np.full((17, 17), 128, dtype=np.uint8)
+    image[8, 8] = 255
+
+    weak = gimp_noise_reduction(image, strength=1)
+    strong = gimp_noise_reduction(image, strength=6)
+
+    assert strong[8, 8] < weak[8, 8] < image[8, 8]
+
+
+def test_gimp_noise_reduction_preserves_alpha_channel() -> None:
+    image = np.zeros((9, 9, 4), dtype=np.float32)
+    image[..., :3] = 0.5
+    image[4, 4, 0] = 1.0
+    image[..., 3] = np.linspace(0.1, 0.9, 81, dtype=np.float32).reshape(9, 9)
+
+    result = gimp_noise_reduction(image, strength=4)
+
+    assert result[4, 4, 0] < image[4, 4, 0]
+    assert np.allclose(result[..., 3], image[..., 3])
+
+
 def test_high_pass_threshold_suppresses_low_detail_noise() -> None:
     image = np.full((16, 16), 128, dtype=np.uint8)
     image[8, 8] = 160
@@ -31,6 +64,62 @@ def test_high_pass_threshold_suppresses_low_detail_noise() -> None:
     strong = high_pass(image, sigma=1.0, amount=1.0, threshold=0.0)
 
     assert weak[8, 8] <= strong[8, 8]
+
+
+def test_high_pass_uses_gimp_style_layer_with_linear_light_only() -> None:
+    image = np.linspace(0.1, 0.9, 49, dtype=np.float32).reshape(7, 7)
+
+    result = high_pass(
+        image,
+        sigma=1.2,
+        amount=0.75,
+        threshold=0.5,
+        halo_suppression=5.0,
+        luminance_only=True,
+    )
+
+    blurred = ndimage.gaussian_filter(image, sigma=1.2, mode="reflect")
+    over = np.clip(0.5 + 0.5 * (image - blurred), 0.0, 1.0)
+    inverse_gamma = 1.0 / 2.2
+    neutral = np.float32(0.5**inverse_gamma)
+    high_pass_layer = np.power(
+        np.clip((np.power(over, inverse_gamma) - neutral) * 0.75 + neutral, 0.0, 1.0),
+        2.2,
+    )
+    expected = np.clip(image + 2.0 * (high_pass_layer - 0.5), 0.0, 1.0)
+
+    assert np.allclose(result, expected, atol=1e-6)
+
+
+def test_high_pass_matches_gimp_gamma_contrast_not_direct_detail_gain() -> None:
+    image = np.zeros((9, 9), dtype=np.float32) + 0.5
+    image[4, 4] = 0.62
+
+    result = high_pass(image, sigma=1.0, amount=1.0)
+    blurred = ndimage.gaussian_filter(image, sigma=1.0, mode="reflect")
+    old_direct_gain = np.clip(image + 2.0 * (image - blurred), 0.0, 1.0)
+
+    assert result[4, 4] < old_direct_gain[4, 4]
+
+
+def test_high_pass_keeps_flat_image_neutral_at_legacy_contrast() -> None:
+    image = np.full((9, 9), 0.42, dtype=np.float32)
+
+    result = high_pass(image, sigma=1.0, amount=2.0)
+
+    assert np.allclose(result, image, atol=1e-5)
+
+
+def test_high_pass_preserves_alpha_channel() -> None:
+    image = np.zeros((7, 7, 4), dtype=np.float32)
+    image[..., 0] = np.linspace(0.1, 0.9, 49, dtype=np.float32).reshape(7, 7)
+    image[..., 1] = 0.4
+    image[..., 2] = 0.6
+    image[..., 3] = np.linspace(0.2, 0.8, 49, dtype=np.float32).reshape(7, 7)
+
+    result = high_pass(image, sigma=1.0, amount=1.0)
+
+    assert np.allclose(result[..., 3], image[..., 3])
 
 
 def test_wavelet_sharpen_preserves_shape_dtype_and_edges() -> None:
@@ -70,7 +159,7 @@ def test_advanced_adjustments_dispatch() -> None:
     image = np.zeros((16, 16), dtype=np.uint8)
     image[8, 8] = 255
 
-    denoised = apply_edit_operation(image, "denoise", {"method": "microscopy"})
+    denoised = apply_edit_operation(image, "denoise", {"method": "gimp", "strength": 4})
     sharpened = apply_edit_operation(image, "wavelet_sharpen", {"levels": 2, "amount": 0.2})
     contrasted = apply_edit_operation(image, "local_contrast", {"radius": 3.0})
     deconvolved = apply_edit_operation(image, "deconvolution", {"iterations": 2})

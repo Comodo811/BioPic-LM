@@ -44,6 +44,7 @@ def align_stack_translation(
     upsample_factor: int = 10,
     max_estimation_size: int = 1024,
     use_cuda: bool = False,
+    refine_euclidean: bool = True,
 ) -> tuple[list[np.ndarray], list[AlignmentTransform]]:
     """Align a stack to the reference image using subject-weighted phase correlation."""
     if not images:
@@ -68,6 +69,7 @@ def align_stack_translation(
             moving,
             subject_mask,
             upsample_factor=upsample_factor,
+            refine_euclidean=refine_euclidean,
         )
         transform = _scale_alignment_transform(estimated, estimation_scale)
         aligned.append(apply_translation(image, transform, use_cuda=use_cuda))
@@ -81,6 +83,7 @@ def estimate_subject_translation(
     subject_mask: np.ndarray | None = None,
     *,
     upsample_factor: int = 10,
+    refine_euclidean: bool = True,
 ) -> AlignmentTransform:
     """Estimate translation while preferring large specimen structure over dust."""
     reference_gray = _normalize_float_image(reference)
@@ -122,22 +125,23 @@ def estimate_subject_translation(
         ),
     )
     best_shift = _clamp_unreasonable_shift(best_shift, reference_gray.shape)
-    affine = _estimate_subject_euclidean_transform(
-        reference_gray,
-        moving_gray,
-        mask,
-        best_shift,
-    )
-    if affine is not None:
-        shift_score = _alignment_score(reference_gray, moving_gray, best_shift, mask)
-        affine_score = _alignment_score(reference_gray, moving_gray, affine, mask)
-        if affine_score <= shift_score * 0.96:
-            return AlignmentTransform(
-                shift_y=float(best_shift[0]),
-                shift_x=float(best_shift[1]),
-                error=float(affine_score),
-                affine=tuple(float(value) for value in affine.reshape(6)),
-            )
+    if refine_euclidean:
+        affine = _estimate_subject_euclidean_transform(
+            reference_gray,
+            moving_gray,
+            mask,
+            best_shift,
+        )
+        if affine is not None:
+            shift_score = _alignment_score(reference_gray, moving_gray, best_shift, mask)
+            affine_score = _alignment_score(reference_gray, moving_gray, affine, mask)
+            if affine_score <= shift_score * 0.96:
+                return AlignmentTransform(
+                    shift_y=float(best_shift[0]),
+                    shift_x=float(best_shift[1]),
+                    error=float(affine_score),
+                    affine=tuple(float(value) for value in affine.reshape(6)),
+                )
     return AlignmentTransform(
         shift_y=float(best_shift[0]),
         shift_x=float(best_shift[1]),

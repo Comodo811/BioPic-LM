@@ -4,10 +4,21 @@ from __future__ import annotations
 
 import math
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+
+def suppress_cupy_environment_warnings() -> None:
+    """Hide CuPy's optional CUDA-path warning when GPU support is unavailable."""
+    warnings.filterwarnings(
+        "ignore",
+        message="CUDA path could not be detected.*",
+        category=UserWarning,
+        module=r"cupy\._environment",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +135,7 @@ def _float32_frame_bytes_from_shape(shape: tuple[int, ...]) -> int:
 
 def configure_cupy_cache() -> None:
     """Point CuPy cache/temp paths at BioPic's writable local cache when unset."""
+    suppress_cupy_environment_warnings()
     base_dir = Path.cwd() / ".biopic_cache"
     temp_dir = base_dir / "cupy_temp"
     try:

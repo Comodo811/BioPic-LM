@@ -13,9 +13,6 @@ from skimage.restoration import (
 )
 
 from biopic.imaging.dtype import restore_dtype, to_float
-from biopic.native.adjustments_backend import (
-    noise_reduction as native_noise_reduction,
-)
 
 
 def high_pass(
@@ -27,28 +24,38 @@ def high_pass(
     halo_suppression: float = 0.0,
     luminance_only: bool = False,
 ) -> np.ndarray:
-    """Apply high-pass sharpening based on `I - G_sigma * I`."""
+    """Apply GIMP-style high-pass sharpening with Linear Light compositing."""
     if sigma <= 0:
         raise ValueError("sigma must be greater than zero")
     data, dtype = to_float(image)
-    if luminance_only and data.ndim == 3 and data.shape[-1] >= 3:
-        luminance = (
-            data[..., 0] * 0.2126 + data[..., 1] * 0.7152 + data[..., 2] * 0.0722
-        )
-        blurred = ndimage.gaussian_filter(luminance, sigma=sigma, mode="reflect")
-        detail = (luminance - blurred)[..., None]
+    del threshold, halo_suppression, luminance_only
+    contrast = max(0.0, float(amount))
+    result = data.copy()
+    if data.ndim == 3 and data.shape[-1] >= 4:
+        color = data[..., :3]
+        result[..., :3] = _linear_light_high_pass(color, sigma, contrast)
+        result[..., 3:] = data[..., 3:]
     else:
-        sigma_spec: float | tuple[float, float, float] = sigma
-        if data.ndim == 3:
-            sigma_spec = (sigma, sigma, 0.0)
-        detail = data - ndimage.gaussian_filter(data, sigma=sigma_spec, mode="reflect")
-    if threshold > 0:
-        detail = np.where(np.abs(detail) >= threshold, detail, 0.0)
-    sharpened = data + detail * amount
-    if halo_suppression > 0:
-        smoothed = _gaussian_float(sharpened, halo_suppression)
-        sharpened = sharpened * 0.75 + smoothed * 0.25
-    return restore_dtype(np.clip(sharpened, 0.0, 1.0), dtype)
+        result = _linear_light_high_pass(data, sigma, contrast)
+    return restore_dtype(np.clip(result, 0.0, 1.0), dtype)
+
+
+def _linear_light_high_pass(data: np.ndarray, sigma: float, contrast: float) -> np.ndarray:
+    high_pass_layer = _gimp_high_pass_layer(data, sigma, contrast)
+    return data + 2.0 * (high_pass_layer - 0.5)
+
+
+def _gimp_high_pass_layer(data: np.ndarray, sigma: float, contrast: float) -> np.ndarray:
+    sigma_spec: float | tuple[float, float, float] = sigma
+    if data.ndim == 3:
+        sigma_spec = (sigma, sigma, 0.0)
+    blurred = ndimage.gaussian_filter(data, sigma=sigma_spec, mode="reflect")
+    over = np.clip(0.5 + 0.5 * (data - blurred), 0.0, 1.0)
+    inverse_gamma = 1.0 / 2.2
+    perceptual = np.power(over, inverse_gamma)
+    neutral = np.float32(0.5**inverse_gamma)
+    contrasted = (perceptual - neutral) * contrast + neutral
+    return np.power(np.clip(contrasted, 0.0, 1.0), 2.2)
 
 
 def gaussian_smooth(image: np.ndarray, sigma: float) -> np.ndarray:
@@ -114,6 +121,29 @@ def total_variation_denoise(image: np.ndarray, weight: float = 0.08) -> np.ndarr
     return restore_dtype(np.asarray(result), dtype)
 
 
+def gimp_noise_reduction(image: np.ndarray, *, strength: int = 4) -> np.ndarray:
+    """Apply GIMP-style iterative anisotropic noise reduction.
+
+    GIMP exposes GEGL's noise-reduction operation as a single Strength value,
+    implemented as repeated anisotropic smoothing iterations. Each iteration
+    smooths along the local axis with the lowest second-derivative error, which
+    reduces grain while avoiding the patchy texture and color mixing produced by
+    the previous median/bilateral/NL-means pipeline.
+    """
+    iterations = _coerce_gimp_noise_reduction_strength(strength)
+    data, dtype = to_float(image)
+    if iterations == 0:
+        return restore_dtype(data.copy(), dtype)
+    result = data.copy()
+    if data.ndim == 3 and data.shape[-1] >= 4:
+        color = data[..., :3]
+        result[..., :3] = _gimp_anisotropic_smooth(color, iterations)
+        result[..., 3:] = data[..., 3:]
+    else:
+        result = _gimp_anisotropic_smooth(data, iterations)
+    return restore_dtype(np.clip(result, 0.0, 1.0), dtype)
+
+
 def microscopy_noise_reduction(
     image: np.ndarray,
     *,
@@ -121,35 +151,65 @@ def microscopy_noise_reduction(
     chroma_strength: float = 0.04,
     impulse_radius: int = 1,
     preserve_edges: bool = True,
+    strength: int | None = None,
 ) -> np.ndarray:
-    """Conservative denoising intended to preserve fine biological structures."""
+    """Compatibility wrapper for GIMP-style noise reduction."""
     if luminance_strength < 0 or chroma_strength < 0:
         raise ValueError("noise-reduction strengths must be non-negative")
-    native = native_noise_reduction(
-        image,
-        luminance_strength=float(luminance_strength),
-        chroma_strength=float(chroma_strength),
-        impulse_radius=int(impulse_radius),
-        preserve_edges=bool(preserve_edges),
-    )
-    if native is not None and not np.array_equal(native, image):
-        return native
-    denoised = image
-    if impulse_radius > 0:
-        denoised = median_filter(denoised, impulse_radius)
-    if preserve_edges:
-        denoised = bilateral_filter(
-            denoised,
-            sigma_color=max(chroma_strength, 0.001),
-            sigma_spatial=max(luminance_strength * 20.0, 1.0),
+    del impulse_radius, preserve_edges
+    iterations = 4 if strength is None else strength
+    return gimp_noise_reduction(image, strength=iterations)
+
+
+def _coerce_gimp_noise_reduction_strength(strength: int | float) -> int:
+    return int(np.clip(round(float(strength)), 0, 32))
+
+
+def _gimp_anisotropic_smooth(data: np.ndarray, iterations: int) -> np.ndarray:
+    if data.ndim == 2:
+        return _gimp_anisotropic_smooth_plane(data, iterations)
+    channels = [
+        _gimp_anisotropic_smooth_plane(data[..., channel], iterations)
+        for channel in range(data.shape[-1])
+    ]
+    return np.stack(channels, axis=-1)
+
+
+def _gimp_anisotropic_smooth_plane(plane: np.ndarray, iterations: int) -> np.ndarray:
+    current = plane.astype(np.float32, copy=True)
+    for _ in range(iterations):
+        padded = np.pad(current, 1, mode="reflect")
+        center = padded[1:-1, 1:-1]
+        neighbours = (
+            padded[:-2, :-2],
+            padded[:-2, 1:-1],
+            padded[:-2, 2:],
+            padded[1:-1, :-2],
+            padded[1:-1, 2:],
+            padded[2:, :-2],
+            padded[2:, 1:-1],
+            padded[2:, 2:],
         )
-    else:
-        denoised = non_local_means(
-            denoised,
-            patch_size=5,
-            h=max(luminance_strength, 0.001),
+        axes = (
+            (neighbours[0], neighbours[7]),
+            (neighbours[1], neighbours[6]),
+            (neighbours[2], neighbours[5]),
+            (neighbours[3], neighbours[4]),
         )
-    return denoised
+        metric_reference = tuple((center * 2.0 - before - after) ** 2 for before, after in axes)
+        total = center.copy()
+        count = np.ones(center.shape, dtype=np.float32)
+        for neighbour in neighbours:
+            value = (center + neighbour) * 0.5
+            valid = np.ones(center.shape, dtype=bool)
+            for axis, (before, after) in enumerate(axes):
+                metric_new = (value * 2.0 - before - after) ** 2
+                valid &= metric_new <= metric_reference[axis]
+            total += np.where(valid, value, 0.0)
+            count += valid
+        current = total / count
+    return current
+
 
 
 def wavelet_sharpen(

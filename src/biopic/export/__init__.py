@@ -5,6 +5,7 @@ from biopic.export.raster import (
     export_image,
     export_project_figure_board,
     export_project_figure_board_latex,
+    export_project_image,
     export_simple_figure_board,
 )
 
@@ -14,6 +15,7 @@ __all__ = [
     "export_image",
     "export_project_figure_board",
     "export_project_figure_board_latex",
+    "export_project_image",
     "export_simple_figure_board",
     "preflight_project",
 ]

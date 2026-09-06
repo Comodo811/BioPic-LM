@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -39,9 +40,7 @@ from biopic.models.figure_board import (
     panels_from_layout,
 )
 from biopic.ui.settings import restore_dialog_size, scrollable_dialog_body
-from biopic.ui.workspace_helpers.common import (
-    layout_ascii_preview as _layout_ascii_preview,
-)
+from biopic.ui.workspace_helpers.common import layout_pixmap_preview as _layout_pixmap_preview
 from biopic.ui.workspace_helpers.common import (
     page_dimension_mm as _page_dimension_mm,
 )
@@ -80,18 +79,30 @@ class FigureBoardDialogsMixin:
         page_combo = QComboBox()
         page_combo.addItems(list(self._page_presets) + ["Custom"])
         page_combo.setCurrentText(self.page_combo.currentText())
-        page_width = QDoubleSpinBox()
-        page_width.setRange(1.0, 5000.0)
-        page_width.setValue(self.page_width.value())
-        page_height = QDoubleSpinBox()
-        page_height.setRange(1.0, 5000.0)
-        page_height.setValue(self.page_height.value())
+        board_width = QDoubleSpinBox()
+        board_width.setRange(1.0, 5000.0)
+        board_width.setValue(self.board_width.value())
+        board_width.setSuffix(" mm")
+        board_height = QDoubleSpinBox()
+        board_height.setRange(1.0, 5000.0)
+        board_height.setValue(self.board_height.value())
+        board_height.setSuffix(" mm")
+        outline_width = QDoubleSpinBox()
+        outline_width.setRange(1.0, 5000.0)
+        outline_width.setValue(self.outline_width.value())
+        outline_width.setSuffix(" mm")
+        outline_height = QDoubleSpinBox()
+        outline_height.setRange(1.0, 5000.0)
+        outline_height.setValue(self.outline_height.value())
+        outline_height.setSuffix(" mm")
         page_unit = QComboBox()
         page_unit.addItems([PageUnit.MM.value, PageUnit.CM.value, PageUnit.INCH.value])
         page_unit.setCurrentText(self.page_unit.currentText())
         page_layout.addRow("Preset", page_combo)
-        page_layout.addRow("Custom Width", page_width)
-        page_layout.addRow("Custom Height", page_height)
+        page_layout.addRow("Board Width", board_width)
+        page_layout.addRow("Board Height", board_height)
+        page_layout.addRow("Outline Width", outline_width)
+        page_layout.addRow("Outline Height", outline_height)
         page_layout.addRow("Units", page_unit)
         layout.addWidget(page_group)
 
@@ -124,8 +135,8 @@ class FigureBoardDialogsMixin:
             if name == "Custom":
                 return
             page = self._page_presets[name]
-            page_width.setValue(page.width)
-            page_height.setValue(page.height)
+            board_width.setValue(page.width)
+            board_height.setValue(page.height)
             page_unit.setCurrentText(page.unit.value)
 
         page_combo.currentTextChanged.connect(preset_changed)
@@ -138,13 +149,18 @@ class FigureBoardDialogsMixin:
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.page_combo.setCurrentText(page_combo.currentText())
-        self.page_width.setValue(page_width.value())
-        self.page_height.setValue(page_height.value())
+        self.page_width.setValue(board_width.value())
+        self.page_height.setValue(board_height.value())
         self.page_unit.setCurrentText(page_unit.currentText())
         self.margin_left.setValue(margin_left.value())
         self.margin_right.setValue(margin_right.value())
         self.margin_top.setValue(margin_top.value())
         self.margin_bottom.setValue(margin_bottom.value())
+        self.board_width.setValue(board_width.value())
+        self.board_height.setValue(board_height.value())
+        self.outline_width.setValue(outline_width.value())
+        self.outline_height.setValue(outline_height.value())
+        self._board_size_controls_changed()
         self._refresh_records()
 
     def open_layout_dialog(self) -> None:
@@ -335,6 +351,8 @@ class FigureBoardDialogsMixin:
 
         presets = QListWidget()
         presets.setMinimumWidth(280)
+        presets.setIconSize(QSize(112, 76))
+        presets.setSpacing(4)
         preview = FigureBoardPreview(self.project)
         preview.set_workspace_watermark_visible(False)
         preview.set_zoom_percent(35)
@@ -355,7 +373,8 @@ class FigureBoardDialogsMixin:
             current_presets.extend(generate_layout_presets(panel_count.value()))
             presets.clear()
             for preset in current_presets:
-                item = QListWidgetItem(f"{preset.name}\n{_layout_ascii_preview(preset)}")
+                item = QListWidgetItem(QIcon(_layout_pixmap_preview(preset)), preset.name)
+                item.setSizeHint(QSize(260, 86))
                 presets.addItem(item)
             presets.setCurrentRow(0)
             refresh_preview()

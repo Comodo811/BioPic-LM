@@ -158,6 +158,9 @@ static PyObject *high_pass(PyObject *self, PyObject *args) {
         PyErr_SetString(PyExc_ValueError, "sigma must be greater than zero");
         return NULL;
     }
+    threshold = 0.0;
+    halo_suppression = 0.0;
+    luminance_only = 0;
     PyArrayObject *image = (PyArrayObject *)PyArray_FROM_OTF(
         image_arg, NPY_NOTYPE, NPY_ARRAY_IN_ARRAY);
     if (image == NULL) {
@@ -278,23 +281,13 @@ static PyObject *high_pass(PyObject *self, PyObject *args) {
             }
             for (size_t i = 0; i < plane_count; ++i) {
                 double detail = plane[i] - blur[i];
-                if (threshold > 0.0 && fabs(detail) < threshold) {
-                    detail = 0.0;
-                }
-                tmp[i] = clamp01(plane[i] + detail * amount);
-            }
-            if (halo_suppression > 0.0) {
-                if (!gaussian_blur_plane(tmp, plane, blur, width, height, halo_suppression)) {
-                    free(plane);
-                    free(tmp);
-                    free(blur);
-                    Py_DECREF(output);
-                    Py_DECREF(image);
-                    return PyErr_NoMemory();
-                }
-                for (size_t i = 0; i < plane_count; ++i) {
-                    tmp[i] = tmp[i] * 0.75 + blur[i] * 0.25;
-                }
+                double over = clamp01(0.5 + 0.5 * detail);
+                double inverse_gamma = 1.0 / 2.2;
+                double perceptual = pow(over, inverse_gamma);
+                double neutral = pow(0.5, inverse_gamma);
+                double contrasted = (perceptual - neutral) * amount + neutral;
+                double high_pass_layer = pow(clamp01(contrasted), 2.2);
+                tmp[i] = clamp01(plane[i] + 2.0 * (high_pass_layer - 0.5));
             }
             for (int y = 0; y < height; ++y) {
                 for (int x = 0; x < width; ++x) {

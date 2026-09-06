@@ -131,6 +131,118 @@ class TilePaintSession:
         self._last_dirty_rects = dirty_rects
         return dirty_rect
 
+    def clone_content_and_alpha(
+        self,
+        points: list[Point],
+        radius: int,
+        source_content: np.ndarray,
+        source_alpha: np.ndarray,
+        source_offset: tuple[int, int],
+        *,
+        selection_rect: Rect | None = None,
+        selection_shape: str = "rectangle",
+        selection_mask: np.ndarray | None = None,
+    ) -> Rect | None:
+        """Clone pixels from source arrays into touched content/alpha tiles."""
+        if not points:
+            return None
+        if selection_rect is None and selection_mask is not None:
+            selection_rect = _mask_bounds(selection_mask)
+        dirty_rects = self._dirty_rects_for_points(points, radius, selection_rect)
+        dirty_rect = union_rects(dirty_rects)
+        offset_x, offset_y = source_offset
+        for coord, tile_rect in self._tiles_for_dirty_rects(dirty_rects):
+            before_content = self._content_tile(coord, tile_rect).copy()
+            before_alpha = self._alpha_tile(coord, tile_rect).copy()
+            content = self._content_tile(coord, tile_rect)
+            alpha = self._alpha_tile(coord, tile_rect)
+            for dirty in dirty_rects:
+                overlap = _intersect_rect(tile_rect, dirty)
+                if overlap is None:
+                    continue
+                ox, oy, ow, oh = overlap
+                tile_ox = ox - tile_rect[0]
+                tile_oy = oy - tile_rect[1]
+                _clone_points_into_tile(
+                    content[tile_oy : tile_oy + oh, tile_ox : tile_ox + ow],
+                    alpha[tile_oy : tile_oy + oh, tile_ox : tile_ox + ow],
+                    source_content,
+                    source_alpha,
+                    overlap,
+                    points,
+                    radius,
+                    offset_x,
+                    offset_y,
+                    selection_rect=selection_rect,
+                    selection_shape=selection_shape,
+                )
+            self._apply_tile_selection_mask(
+                coord,
+                tile_rect,
+                before_content,
+                before_alpha,
+                selection_mask,
+            )
+        self._dirty_region.add(dirty_rect)
+        self._last_dirty_rects = dirty_rects
+        return dirty_rect
+
+    def heal_content_and_alpha(
+        self,
+        points: list[Point],
+        radius: int,
+        source_content: np.ndarray,
+        source_alpha: np.ndarray,
+        source_offset: tuple[int, int],
+        *,
+        selection_rect: Rect | None = None,
+        selection_shape: str = "rectangle",
+        selection_mask: np.ndarray | None = None,
+    ) -> Rect | None:
+        """Heal pixels from source texture while matching destination illumination."""
+        if not points:
+            return None
+        if selection_rect is None and selection_mask is not None:
+            selection_rect = _mask_bounds(selection_mask)
+        dirty_rects = self._dirty_rects_for_points(points, radius, selection_rect)
+        dirty_rect = union_rects(dirty_rects)
+        offset_x, offset_y = source_offset
+        for coord, tile_rect in self._tiles_for_dirty_rects(dirty_rects):
+            before_content = self._content_tile(coord, tile_rect).copy()
+            before_alpha = self._alpha_tile(coord, tile_rect).copy()
+            content = self._content_tile(coord, tile_rect)
+            alpha = self._alpha_tile(coord, tile_rect)
+            for dirty in dirty_rects:
+                overlap = _intersect_rect(tile_rect, dirty)
+                if overlap is None:
+                    continue
+                ox, oy, ow, oh = overlap
+                tile_ox = ox - tile_rect[0]
+                tile_oy = oy - tile_rect[1]
+                _heal_points_into_tile(
+                    content[tile_oy : tile_oy + oh, tile_ox : tile_ox + ow],
+                    alpha[tile_oy : tile_oy + oh, tile_ox : tile_ox + ow],
+                    source_content,
+                    source_alpha,
+                    overlap,
+                    points,
+                    radius,
+                    offset_x,
+                    offset_y,
+                    selection_rect=selection_rect,
+                    selection_shape=selection_shape,
+                )
+            self._apply_tile_selection_mask(
+                coord,
+                tile_rect,
+                before_content,
+                before_alpha,
+                selection_mask,
+            )
+        self._dirty_region.add(dirty_rect)
+        self._last_dirty_rects = dirty_rects
+        return dirty_rect
+
     def last_dirty_rects(self) -> list[Rect]:
         """Return precise dirty rectangles from the most recent paint operation."""
         return list(self._last_dirty_rects)
@@ -401,3 +513,166 @@ def _intersect_rect(first: Rect, second: Rect) -> Rect | None:
     if x1 <= x0 or y1 <= y0:
         return None
     return (x0, y0, x1 - x0, y1 - y0)
+
+
+def _clone_points_into_tile(
+    content: np.ndarray,
+    alpha: np.ndarray,
+    source_content: np.ndarray,
+    source_alpha: np.ndarray,
+    tile_rect: Rect,
+    points: list[Point],
+    radius: int,
+    offset_x: int,
+    offset_y: int,
+    *,
+    selection_rect: Rect | None,
+    selection_shape: str,
+) -> None:
+    tile_x, tile_y, width, height = tile_rect
+    yy, xx = np.ogrid[tile_y : tile_y + height, tile_x : tile_x + width]
+    mask = np.zeros((height, width), dtype=bool)
+    for center_x, center_y in points:
+        mask |= (xx - center_x) ** 2 + (yy - center_y) ** 2 <= radius**2
+    if selection_rect is not None:
+        sx, sy, selection_width, selection_height = selection_rect
+        mask &= (
+            (xx >= sx)
+            & (xx < sx + selection_width)
+            & (yy >= sy)
+            & (yy < sy + selection_height)
+        )
+        if selection_shape == "ellipse":
+            center_selection_x = sx + (selection_width - 1) / 2.0
+            center_selection_y = sy + (selection_height - 1) / 2.0
+            radius_selection_x = max(selection_width / 2.0, 0.5)
+            radius_selection_y = max(selection_height / 2.0, 0.5)
+            mask &= (
+                ((xx - center_selection_x) / radius_selection_x) ** 2
+                + ((yy - center_selection_y) / radius_selection_y) ** 2
+                <= 1.0
+            )
+    source_xs = np.broadcast_to(xx + offset_x, mask.shape)
+    source_ys = np.broadcast_to(yy + offset_y, mask.shape)
+    source_height, source_width = source_content.shape[:2]
+    mask &= (
+        (source_xs >= 0)
+        & (source_xs < source_width)
+        & (source_ys >= 0)
+        & (source_ys < source_height)
+    )
+    if not np.any(mask):
+        return
+    content[mask] = source_content[source_ys[mask], source_xs[mask]]
+    alpha[mask] = source_alpha[source_ys[mask], source_xs[mask]]
+
+
+def _heal_points_into_tile(
+    content: np.ndarray,
+    alpha: np.ndarray,
+    source_content: np.ndarray,
+    source_alpha: np.ndarray,
+    tile_rect: Rect,
+    points: list[Point],
+    radius: int,
+    offset_x: int,
+    offset_y: int,
+    *,
+    selection_rect: Rect | None,
+    selection_shape: str,
+) -> None:
+    for center_x, center_y in points:
+        _heal_point_into_tile(
+            content,
+            alpha,
+            source_content,
+            source_alpha,
+            tile_rect,
+            center_x,
+            center_y,
+            radius,
+            offset_x,
+            offset_y,
+            selection_rect=selection_rect,
+            selection_shape=selection_shape,
+        )
+
+
+def _heal_point_into_tile(
+    content: np.ndarray,
+    alpha: np.ndarray,
+    source_content: np.ndarray,
+    source_alpha: np.ndarray,
+    tile_rect: Rect,
+    center_x: int,
+    center_y: int,
+    radius: int,
+    offset_x: int,
+    offset_y: int,
+    *,
+    selection_rect: Rect | None,
+    selection_shape: str,
+) -> None:
+    tile_x, tile_y, width, height = tile_rect
+    yy, xx = np.ogrid[tile_y : tile_y + height, tile_x : tile_x + width]
+    distance_sq = (xx - center_x) ** 2 + (yy - center_y) ** 2
+    disk = distance_sq <= radius**2
+    if selection_rect is not None:
+        disk &= _selection_mask_for_grid(xx, yy, selection_rect, selection_shape)
+    source_xs = np.broadcast_to(xx + offset_x, disk.shape)
+    source_ys = np.broadcast_to(yy + offset_y, disk.shape)
+    source_height, source_width = source_content.shape[:2]
+    disk &= (
+        (source_xs >= 0)
+        & (source_xs < source_width)
+        & (source_ys >= 0)
+        & (source_ys < source_height)
+    )
+    if not np.any(disk):
+        return
+    source_values = source_content[source_ys[disk], source_xs[disk]].astype(np.float32, copy=False)
+    destination_values = content[disk].astype(np.float32, copy=False)
+    source_mean = source_values.reshape(-1, *source_content.shape[2:]).mean(axis=0)
+    destination_mean = destination_values.reshape(-1, *content.shape[2:]).mean(axis=0)
+    healed = source_values - source_mean + destination_mean
+    if np.issubdtype(content.dtype, np.integer):
+        info = np.iinfo(content.dtype)
+        healed = np.clip(healed, info.min, info.max)
+    else:
+        healed = np.clip(healed, 0.0, 1.0)
+    if radius > 1:
+        distance = np.sqrt(distance_sq[disk].astype(np.float32, copy=False))
+        feather = np.clip((float(radius) + 0.5 - distance) / max(1.0, radius * 0.35), 0.0, 1.0)
+    else:
+        feather = np.ones(int(np.count_nonzero(disk)), dtype=np.float32)
+    if content.ndim == 3:
+        feather = feather[..., None]
+    blended = destination_values * (1.0 - feather) + healed * feather
+    content[disk] = _restore_tile_dtype(blended, content.dtype)
+    alpha[disk] = np.maximum(alpha[disk], source_alpha[source_ys[disk], source_xs[disk]])
+
+
+def _selection_mask_for_grid(
+    xx: np.ndarray,
+    yy: np.ndarray,
+    selection_rect: Rect,
+    selection_shape: str,
+) -> np.ndarray:
+    sx, sy, selection_width, selection_height = selection_rect
+    mask = (
+        (xx >= sx)
+        & (xx < sx + selection_width)
+        & (yy >= sy)
+        & (yy < sy + selection_height)
+    )
+    if selection_shape == "ellipse":
+        center_selection_x = sx + (selection_width - 1) / 2.0
+        center_selection_y = sy + (selection_height - 1) / 2.0
+        radius_selection_x = max(selection_width / 2.0, 0.5)
+        radius_selection_y = max(selection_height / 2.0, 0.5)
+        mask &= (
+            ((xx - center_selection_x) / radius_selection_x) ** 2
+            + ((yy - center_selection_y) / radius_selection_y) ** 2
+            <= 1.0
+        )
+    return mask

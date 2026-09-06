@@ -6,7 +6,8 @@ import numpy as np
 from PySide6.QtCore import QProcess
 from PySide6.QtWidgets import QListWidgetItem
 
-from biopic.imaging.layer_buffers import set_layer_buffers, share_layer_buffers
+from biopic.imaging.layer_buffers import clear_layer_buffers, set_layer_buffers, share_layer_buffers
+from biopic.imaging.project_render import _blend, layer_alpha, layer_pixels
 from biopic.integrations.gpl_editors import (
     external_edit_cache_path,
     find_external_editor,
@@ -145,8 +146,11 @@ class EditLayerCommandsMixin:
         adjustment = self.project.adjustment_layers.get(str(current.data(256)))
         if adjustment is None:
             return
+        before = self._snapshot_edit_state()
         self.project.update_adjustment_layer(adjustment.id, enabled=not adjustment.enabled)
+        self._finish_command("toggle adjustment", before)
         self._render_current_adjustment_preview()
+        self._refresh_layers()
         self._refresh_adjustments()
         if self.editApplied is not None:
             self.editApplied()
@@ -156,9 +160,13 @@ class EditLayerCommandsMixin:
         current = self.adjustment_list.currentItem()
         if current is None:
             return
+        before = self._snapshot_edit_state()
         self.project.adjustment_layers.pop(str(current.data(256)), None)
         self.project.touch()
+        self._finish_command("delete adjustment", before)
+        self._refresh_layers()
         self._refresh_adjustments()
+        self._render_current_adjustment_preview()
         if self.editApplied is not None:
             self.editApplied()
 
@@ -167,8 +175,13 @@ class EditLayerCommandsMixin:
         current = self.layers_list.currentItem()
         if current is None:
             return
+        if current.data(257) == "adjustment":
+            self._status("Use the adjustment settings or Adjustments tab for adjustment layers.")
+            return
         layer = self.project.edit_layers.get(str(current.data(256)))
-        if layer is None or layer.locked:
+        if layer is None:
+            return
+        if layer.locked:
             self._status("Cannot delete a locked layer.")
             return
         before = self._snapshot_edit_state()
@@ -185,6 +198,9 @@ class EditLayerCommandsMixin:
         """Duplicate the selected layer record."""
         current = self.layers_list.currentItem()
         if current is None:
+            return
+        if current.data(257) == "adjustment":
+            self._status("Use the adjustment settings or Adjustments tab for adjustment layers.")
             return
         layer = self.project.edit_layers.get(str(current.data(256)))
         if layer is None:
@@ -207,6 +223,8 @@ class EditLayerCommandsMixin:
             offset_x=layer.offset_x,
             offset_y=layer.offset_y,
             order=self._next_layer_order(layer.source_node_id),
+            filter_operation=layer.filter_operation,
+            filter_parameters=dict(layer.filter_parameters),
             content=layer.content,
             alpha=layer.alpha,
         )
@@ -217,6 +235,68 @@ class EditLayerCommandsMixin:
             self._current_layer_id = duplicate.id
         self.project.touch()
         self._finish_command("duplicate layer", before)
+        self._invalidate_edit_composite_cache()
+        self._refresh_layers()
+        self._render_current_adjustment_preview()
+        if self.editApplied is not None:
+            self.editApplied()
+
+    def merge_selected_layer_down(self) -> None:
+        """Merge the selected editable layer into the composited layer below it."""
+        current = self.layers_list.currentItem()
+        if current is None:
+            return
+        if current.data(257) == "adjustment":
+            self._status("Adjustment layers cannot be merged down here.")
+            return
+        if self._base_pixels is None:
+            return
+        layer = self.project.edit_layers.get(str(current.data(256)))
+        if layer is None:
+            return
+        if layer.locked or LayerLock.PIXELS in layer.lock_flags:
+            self._status("Cannot merge a locked layer.")
+            return
+        layers = [
+            item
+            for item in sorted(self.project.edit_layers.values(), key=lambda item: item.order)
+            if item.source_node_id in {None, layer.source_node_id}
+        ]
+        try:
+            index = next(position for position, item in enumerate(layers) if item.id == layer.id)
+        except StopIteration:
+            return
+        if index <= 0:
+            self._status("There is no editable layer below the selected layer.")
+            return
+        target = layers[index - 1]
+        if target.locked or LayerLock.PIXELS in target.lock_flags:
+            self._status("Cannot merge into a locked layer.")
+            return
+        before = self._snapshot_edit_state()
+        merged_pixels, merged_alpha = _merge_two_layers(self._base_pixels, target, layer)
+        target.content_kind = LayerContentKind.RASTER
+        target.visible = True
+        target.opacity = 1.0
+        target.blend_mode = BlendMode.NORMAL
+        target.offset_x = 0
+        target.offset_y = 0
+        target.mask_content = None
+        target.mask_enabled = False
+        target.filter_operation = None
+        target.filter_parameters = {}
+        target.set_content_pixels(merged_pixels)
+        target.set_alpha_pixels(merged_alpha)
+        set_layer_buffers(target.id, merged_pixels, merged_alpha)
+        self.project.edit_layers.pop(layer.id, None)
+        clear_layer_buffers(layer.id)
+        for order, item in enumerate(sorted(self.project.edit_layers.values(), key=lambda item: item.order)):
+            item.order = order
+        if target.source_node_id is not None:
+            self.project.active_edit_layers[target.source_node_id] = target.id
+        self._current_layer_id = target.id
+        self.project.touch()
+        self._finish_command("merge layer down", before)
         self._invalidate_edit_composite_cache()
         self._refresh_layers()
         self._render_current_adjustment_preview()
@@ -235,8 +315,14 @@ class EditLayerCommandsMixin:
         current = self.layers_list.currentItem()
         if current is None:
             return
+        if current.data(257) == "adjustment":
+            self._status("Adjustment order is managed in the adjustment stack.")
+            return
         layer_ids = list(self.project.edit_layers)
-        index = layer_ids.index(str(current.data(256)))
+        current_id = str(current.data(256))
+        if current_id not in layer_ids:
+            return
+        index = layer_ids.index(current_id)
         target = max(0, min(len(layer_ids) - 1, index + direction))
         if index == target:
             return
@@ -262,7 +348,11 @@ class EditLayerCommandsMixin:
         current: QListWidgetItem | None,
         _previous: QListWidgetItem | None = None,
     ) -> None:
+        self._commit_pending_layer_opacity_change()
         if current is None:
+            return
+        if current.data(257) == "adjustment":
+            self._current_layer_id = None
             return
         layer = self.project.edit_layers.get(str(current.data(256)))
         if layer is None:
@@ -271,25 +361,71 @@ class EditLayerCommandsMixin:
         if layer.source_node_id is not None:
             self.project.active_edit_layers[layer.source_node_id] = layer.id
         self.layer_opacity_spin.blockSignals(True)
+        self.layer_opacity_slider.blockSignals(True)
         self.layer_blend_combo.blockSignals(True)
         self.layer_visible_check.blockSignals(True)
         self.layer_lock_check.blockSignals(True)
         self.layer_position_lock_check.blockSignals(True)
         self.layer_visibility_lock_check.blockSignals(True)
         self.layer_opacity_spin.setValue(layer.opacity * 100.0)
+        self.layer_opacity_slider.setValue(round(layer.opacity * 100.0))
         self.layer_blend_combo.setCurrentText(layer.blend_mode.value)
         self.layer_visible_check.setChecked(layer.visible)
         self.layer_lock_check.setChecked(layer.locked or LayerLock.PIXELS in layer.lock_flags)
         self.layer_position_lock_check.setChecked(LayerLock.POSITION in layer.lock_flags)
         self.layer_visibility_lock_check.setChecked(LayerLock.VISIBILITY in layer.lock_flags)
         self.layer_opacity_spin.blockSignals(False)
+        self.layer_opacity_slider.blockSignals(False)
         self.layer_blend_combo.blockSignals(False)
         self.layer_visible_check.blockSignals(False)
         self.layer_lock_check.blockSignals(False)
         self.layer_position_lock_check.blockSignals(False)
         self.layer_visibility_lock_check.blockSignals(False)
 
+    def _layer_opacity_slider_changed(self, value: int) -> None:
+        self.layer_opacity_spin.blockSignals(True)
+        self.layer_opacity_spin.setValue(float(value))
+        self.layer_opacity_spin.blockSignals(False)
+        self._apply_layer_controls_impl(_opacity_only=True)
+
+    def _layer_opacity_spin_changed(self, value: float) -> None:
+        self.layer_opacity_slider.blockSignals(True)
+        self.layer_opacity_slider.setValue(round(value))
+        self.layer_opacity_slider.blockSignals(False)
+        self._apply_layer_controls_impl(_opacity_only=True)
+
+    def _queue_layer_opacity_render(self) -> None:
+        self._pending_layer_opacity_render = True
+        if not self._layer_opacity_render_timer.isActive():
+            self._layer_opacity_render_timer.start()
+
+    def _flush_pending_layer_opacity_render(self) -> None:
+        if not self._pending_layer_opacity_render:
+            return
+        self._pending_layer_opacity_render = False
+        self._invalidate_edit_composite_cache()
+        self._render_current_adjustment_preview()
+
+    def _commit_pending_layer_opacity_change(self) -> None:
+        pending = self._pending_layer_opacity_command
+        if pending is None:
+            return
+        self._pending_layer_opacity_command = None
+        self._layer_opacity_commit_timer.stop()
+        layer_id, before = pending
+        layer = self.project.edit_layers.get(layer_id)
+        if layer is None:
+            return
+        self._finish_layer_metadata_command("change layer opacity", layer, before)
+        if self.editApplied is not None:
+            self.editApplied()
+
     def _apply_layer_controls(self, _value: object = None) -> None:
+        self._apply_layer_controls_impl()
+
+    def _apply_layer_controls_impl(self, _opacity_only: bool = False) -> None:
+        if not _opacity_only:
+            self._commit_pending_layer_opacity_change()
         current = self.layers_list.currentItem()
         if current is None:
             return
@@ -326,15 +462,64 @@ class EditLayerCommandsMixin:
         layer.blend_mode = BlendMode(self.layer_blend_combo.currentText())
         layer.bump_generation()
         self.project.touch()
-        self._finish_layer_metadata_command("change layer properties", layer, before)
-        self._update_current_layer_item(layer)
         needs_render = (
             previous_visible != layer.visible
             or previous_opacity != layer.opacity
             or previous_blend != layer.blend_mode
         )
+        if _opacity_only and previous_opacity != layer.opacity:
+            pending = self._pending_layer_opacity_command
+            if pending is not None and pending[0] != layer.id:
+                self._commit_pending_layer_opacity_change()
+                pending = None
+            if pending is None:
+                self._pending_layer_opacity_command = (layer.id, before)
+            self._queue_layer_opacity_render()
+            self._layer_opacity_commit_timer.start()
+            return
+        self._commit_pending_layer_opacity_change()
+        self._finish_layer_metadata_command("change layer properties", layer, before)
+        self._update_current_layer_item(layer)
         if needs_render:
             self._invalidate_edit_composite_cache()
             self._render_current_adjustment_preview()
         if self.editApplied is not None:
             self.editApplied()
+
+
+def _merge_two_layers(
+    base_pixels: np.ndarray,
+    lower: EditLayer,
+    upper: EditLayer,
+) -> tuple[np.ndarray, np.ndarray]:
+    lower_pixels = layer_pixels(lower, base_pixels)
+    upper_pixels = layer_pixels(upper, base_pixels)
+    if lower_pixels is None:
+        lower_pixels = np.zeros_like(base_pixels)
+    if upper_pixels is None:
+        upper_pixels = np.zeros_like(base_pixels)
+    lower_alpha = (
+        layer_alpha(lower, base_pixels)
+        if lower.visible
+        else np.zeros(base_pixels.shape[:2], dtype=np.float32)
+    )
+    upper_alpha = (
+        layer_alpha(upper, base_pixels)
+        if upper.visible
+        else np.zeros(base_pixels.shape[:2], dtype=np.float32)
+    )
+    lower_alpha = np.clip(lower_alpha * float(lower.opacity), 0.0, 1.0)
+    upper_alpha = np.clip(upper_alpha * float(upper.opacity), 0.0, 1.0)
+    visible = _blend(
+        lower_pixels.astype(np.float32, copy=False),
+        upper_pixels,
+        upper_alpha,
+        upper.blend_mode,
+    )
+    alpha = np.clip(upper_alpha + lower_alpha * (1.0 - upper_alpha), 0.0, 1.0)
+    if np.issubdtype(base_pixels.dtype, np.integer):
+        limit = np.iinfo(base_pixels.dtype)
+        pixels = np.clip(np.rint(visible), limit.min, limit.max).astype(base_pixels.dtype)
+    else:
+        pixels = visible.astype(base_pixels.dtype, copy=False)
+    return pixels, alpha.astype(np.float32, copy=False)

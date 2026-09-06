@@ -1,11 +1,9 @@
 # Architecture
 
-## 1. Analysis of `decomp.txt`
+## 1. Reference Behavior
 
-`decomp.txt` is Ghidra pseudocode from a Windows Delphi/VCL-style binary. Most of
-the file is runtime, common controls, WIC/GDI bitmap handling, zlib/OpenSSL, and
-framework code. The relevant application-specific region contains stacking and
-alignment commands with user-visible behavior:
+BioPic LM preserves the important user-visible stacking and alignment behavior
+from the reference workflow:
 
 - named modes: `Stacking`, `Colour stacking`, `Alignment`, `Dividing`;
 - progress captions: `PROGRAM: Stacking in progress...`,
@@ -21,11 +19,10 @@ alignment commands with user-visible behavior:
 - background/output variants suggested by suffixes such as `_bgdark`,
   `_bgbrit`, `_bgmix`, `_bglast`, `_bgcol`, `_fil`, `_sup`, and `_skip`.
 
-The numerical details are ambiguous because the dump lacks symbolic names and
-includes global state. BioPic LM uses those items only as behavioral reference: the
-user gets explicit alignment, skip/exclude, preview/result/depth-map outputs,
-progress state, result naming, and optional step export. The implementation is
-original Python/NumPy/SciPy code with documented parameters and tests.
+BioPic LM uses those items only as behavioral reference: the user gets explicit
+alignment, skip/exclude, preview/result/depth-map outputs, progress state, result
+naming, and optional step export. The implementation is original
+Python/NumPy/SciPy code with documented parameters and tests.
 
 ## 2. Recommended Stack
 

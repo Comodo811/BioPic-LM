@@ -5,6 +5,8 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import numpy as np
 
 from biopic.imaging.adjustments import render_adjustment_pipeline
@@ -22,6 +24,11 @@ from biopic.models.editing import (
 from biopic.models.image_asset import ImageAsset
 from biopic.models.project import Project
 
+_RENDER_CACHE_MAX_ENTRIES = 16
+_RENDER_CACHE_MAX_BYTES = 1024 * 1024 * 1024
+_RENDER_CACHE: OrderedDict[tuple[object, ...], np.ndarray] = OrderedDict()
+_RENDER_CACHE_BYTES = 0
+
 
 def editable_assets(project: Project) -> list[ImageAsset]:
     """Return assets that should appear in normal image-processing workspaces."""
@@ -31,7 +38,11 @@ def editable_assets(project: Project) -> list[ImageAsset]:
     return [
         asset
         for asset in project.assets.values()
-        if asset.id not in stack_source_ids and asset.is_editable_browser_image
+        if (
+            asset.id not in stack_source_ids
+            and asset.is_editable_browser_image
+            and asset.metadata.get("internal_figure_board_asset") is not True
+        )
     ]
 
 
@@ -53,15 +64,23 @@ def source_node_for_asset(project: Project, asset: ImageAsset) -> str | None:
 
 def render_project_image(project: Project, node_id: str) -> np.ndarray | None:
     """Render a source image plus editable and adjustment layers."""
+    cache_key = project_image_cache_key(project, node_id)
+    if cache_key is None:
+        return None
+    project_cache_key = (id(project), cache_key)
+    cached = _RENDER_CACHE.get(project_cache_key)
+    if cached is not None:
+        _RENDER_CACHE.move_to_end(project_cache_key)
+        return cached
     asset = asset_for_source_node(project, node_id)
     if asset is None:
         return None
     base = load_asset_pixels(asset)
     base = render_edit_layers(project, node_id, base)
     layers = project.adjustment_layers_for_image(node_id)
-    if not layers:
-        return base
-    return render_adjustment_pipeline(base, layers)
+    rendered = base if not layers else render_adjustment_pipeline(base, layers)
+    _store_render_cache(project_cache_key, rendered)
+    return rendered
 
 
 def project_image_cache_key(project: Project, node_id: str) -> tuple[object, ...] | None:
@@ -80,6 +99,11 @@ def project_image_cache_key(project: Project, node_id: str) -> tuple[object, ...
             layer.offset_y,
             layer.content_kind.value,
             layer.generation,
+            layer.mask_enabled,
+            layer.mask_edit_state.value,
+            id(layer.mask_content),
+            id(layer_content_buffer(layer.id)),
+            id(layer_alpha_buffer(layer.id)),
             id(layer.content),
             id(layer.alpha),
         )
@@ -105,6 +129,30 @@ def project_image_cache_key(project: Project, node_id: str) -> tuple[object, ...
         edit_layers,
         adjustment_layers,
     )
+
+
+def clear_project_render_cache() -> None:
+    """Clear cached full-image project renders."""
+    global _RENDER_CACHE_BYTES
+    _RENDER_CACHE.clear()
+    _RENDER_CACHE_BYTES = 0
+
+
+def _store_render_cache(key: tuple[object, ...], rendered: np.ndarray) -> None:
+    global _RENDER_CACHE_BYTES
+    if rendered.nbytes > _RENDER_CACHE_MAX_BYTES:
+        return
+    existing = _RENDER_CACHE.pop(key, None)
+    if existing is not None:
+        _RENDER_CACHE_BYTES -= int(existing.nbytes)
+    _RENDER_CACHE[key] = rendered
+    _RENDER_CACHE_BYTES += int(rendered.nbytes)
+    while (
+        len(_RENDER_CACHE) > _RENDER_CACHE_MAX_ENTRIES
+        or _RENDER_CACHE_BYTES > _RENDER_CACHE_MAX_BYTES
+    ):
+        _old_key, old_value = _RENDER_CACHE.popitem(last=False)
+        _RENDER_CACHE_BYTES -= int(old_value.nbytes)
 
 
 def _freeze_cache_value(value: object) -> object:

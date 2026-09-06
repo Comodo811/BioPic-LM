@@ -13,6 +13,7 @@ from biopic.imaging.layer_buffers import (
     layer_alpha_buffer,
     layer_content_buffer,
 )
+from biopic.imaging.project_render import render_edit_layers, render_project_image
 
 LOGGER = logging.getLogger(__name__)
 
@@ -20,17 +21,25 @@ LOGGER = logging.getLogger(__name__)
 class EditRenderingMixin:
     """Shared preview rendering and edit-composite cache behavior."""
 
-    def _adjustment_preview_base(self, exclude_operation: str | None = None) -> np.ndarray | None:
+    def _adjustment_preview_base(
+        self,
+        exclude_operation: str | None = None,
+        *,
+        exclude_layer_id: str | None = None,
+    ) -> np.ndarray | None:
         if self._base_pixels is None or self._current_asset_id is None:
             return None
         source_node = self.project.source_node_id_for_asset(self._current_asset_id)
         if source_node is None:
             return self._base_pixels.copy()
-        base = self._render_edit_composite_cached(source_node)
+        base = render_edit_layers(self.project, source_node, self._base_pixels)
         layers = [
             layer
             for layer in self.project.adjustment_layers_for_image(source_node)
-            if exclude_operation is None or layer.operation != exclude_operation
+            if (
+                (exclude_operation is None or layer.operation != exclude_operation)
+                and (exclude_layer_id is None or layer.id != exclude_layer_id)
+            )
         ]
         return render_adjustment_pipeline(base, layers)
 
@@ -44,13 +53,18 @@ class EditRenderingMixin:
             self.canvas.set_pixels(self._current_pixels, "base image", fit=False)
             return
         layers = self.project.adjustment_layers_for_image(source_node)
-        layer_composite = self._render_edit_composite_cached(source_node)
-        rendered = render_adjustment_pipeline(layer_composite, layers)
+        rendered = render_project_image(self.project, source_node)
+        if rendered is None:
+            layer_composite = self._render_edit_composite_cached(source_node)
+            rendered = render_adjustment_pipeline(layer_composite, layers)
         cache_key = adjustment_pipeline_cache_key(source_node, layers)
         for layer in layers:
             layer.cache_key = cache_key
         self._current_pixels = rendered
-        self.canvas.set_pixels(rendered, f"adjusted preview {cache_key[:18]}", fit=False)
+        self.canvas.set_pixels(rendered, "Adjusted preview", fit=False)
+        asset = self.project.assets.get(self._current_asset_id)
+        if asset is not None:
+            self._loaded_asset_signature = self._asset_render_signature(asset)
         LOGGER.debug(
             "edit preview rendered in %.3fs for shape=%s adjustment_layers=%d",
             perf_counter() - start,
@@ -106,6 +120,10 @@ class EditRenderingMixin:
                 layer.offset_x,
                 layer.offset_y,
                 layer.content_kind.value,
+                layer.generation,
+                layer.mask_enabled,
+                layer.mask_edit_state.value,
+                id(layer.mask_content),
                 id(layer_content_buffer(layer.id)),
                 id(layer_alpha_buffer(layer.id)),
                 id(layer.content),

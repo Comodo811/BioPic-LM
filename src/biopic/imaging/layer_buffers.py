@@ -82,10 +82,19 @@ def sync_layer_buffers_to_payload(layer: EditLayer) -> None:
     """Persist a layer's live buffers into its serializable payload."""
     content = layer_content_buffer(layer.id)
     alpha = layer_alpha_buffer(layer.id)
-    if content is not None:
+    if content is not None and not _payload_matches(layer.content_pixels(), content):
         layer.set_content_pixels(content)
-    if alpha is not None:
+    if alpha is not None and not _payload_matches(layer.alpha_pixels(), alpha):
         layer.set_alpha_pixels(alpha)
+
+
+def _payload_matches(payload: np.ndarray | None, buffer: np.ndarray) -> bool:
+    if payload is None:
+        return False
+    return payload.shape == buffer.shape and payload.dtype == buffer.dtype and np.array_equal(
+        payload,
+        buffer,
+    )
 
 
 def _drop_buffer_refs(layer_id: str) -> None:

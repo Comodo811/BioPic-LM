@@ -21,9 +21,12 @@ _TOOL_ICON_FILES = {
     "brush": "paintbrush_icon.png",
     "pencil": "pencil_icon.png",
     "erase": "eraser_icon.png",
+    "clone": "clone_icon.png",
+    "heal": "heal_icon.png",
     "color_picker": "color_picker_icon.png",
     "zoom": "zoom_icon.png",
     "pan": "move_icon.png",
+    "rotate": "rotate_icon.png",
 }
 
 

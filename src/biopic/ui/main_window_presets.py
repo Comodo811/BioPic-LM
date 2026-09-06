@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from biopic.models.calibration import MagnificationScale, ScalePreset, parse_magnification
+from biopic.ui.settings import set_settings_json, settings_json
 
 
 class MainWindowPresetsMixin:
@@ -31,6 +32,7 @@ class MainWindowPresetsMixin:
         return callback
 
     def _rebuild_metadata_preset_menus(self) -> None:
+        self._load_persistent_metadata_presets()
         self.equipment_presets_menu.clear()
         self._add_action(
             self.equipment_presets_menu,
@@ -134,6 +136,7 @@ class MainWindowPresetsMixin:
         presets = self.project.metadata_presets.setdefault(category, [])
         presets[:] = [item for item in presets if item.get("name") != preset["name"]]
         presets.append(preset)
+        self._save_persistent_metadata_presets()
         self.project.touch()
         self._has_unsaved_changes = True
         self.metadata_workspace.refresh_metadata_presets()
@@ -233,6 +236,7 @@ class MainWindowPresetsMixin:
         presets.append(preset)
         self._sync_equipment_scale_preset(preset)
         self.measure_workspace._save_persistent_scale_presets()
+        self._save_persistent_metadata_presets()
         self.project.touch()
         self._has_unsaved_changes = True
         self.metadata_workspace.refresh_metadata_presets()
@@ -257,7 +261,7 @@ class MainWindowPresetsMixin:
             scales.append(
                 MagnificationScale(
                     magnification=magnification,
-                    fluid="Water",
+                    fluid="Air",
                     distance_pixels=known_distance * pixels_per_unit,
                     known_distance=known_distance,
                     unit="ÃŽÂ¼m",
@@ -292,3 +296,59 @@ class MainWindowPresetsMixin:
             return anchors[magnification]
         nearest = min(anchors, key=lambda value: abs(value - magnification))
         return anchors[nearest] * nearest / magnification
+
+    def _load_persistent_metadata_presets(self) -> None:
+        if bool(getattr(self, "_persistent_metadata_presets_loaded", False)):
+            return
+        data = settings_json(
+            "presets/metadata",
+            {
+                "schema_version": 1,
+                "metadata_presets": {
+                    "equipment": [],
+                    "location": [],
+                    "collector": [],
+                    "preparation": [],
+                },
+            },
+        )
+        presets_by_category = data.get("metadata_presets", {}) if isinstance(data, dict) else {}
+        if not isinstance(presets_by_category, dict):
+            presets_by_category = {}
+        for category in ("equipment", "location", "collector", "preparation"):
+            project_presets = self.project.metadata_presets.setdefault(category, [])
+            existing_names = {
+                str(item.get("name", "")).casefold()
+                for item in project_presets
+                if isinstance(item, dict)
+            }
+            stored_presets = presets_by_category.get(category, [])
+            if not isinstance(stored_presets, list):
+                continue
+            for stored in stored_presets:
+                if not isinstance(stored, dict):
+                    continue
+                preset = {str(key): value for key, value in stored.items()}
+                name = str(preset.get("name", "")).strip()
+                if not name or name.casefold() in existing_names:
+                    continue
+                project_presets.append(preset)
+                existing_names.add(name.casefold())
+        self._persistent_metadata_presets_loaded = True
+
+    def _save_persistent_metadata_presets(self) -> None:
+        set_settings_json(
+            "presets/metadata",
+            {
+                "schema_version": 1,
+                "metadata_presets": {
+                    category: [
+                        dict(preset)
+                        for preset in self.project.metadata_presets.get(category, [])
+                        if isinstance(preset, dict) and str(preset.get("name", "")).strip()
+                    ]
+                    for category in ("equipment", "location", "collector", "preparation")
+                },
+            },
+        )
+        self._persistent_metadata_presets_loaded = True

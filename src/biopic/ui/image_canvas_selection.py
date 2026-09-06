@@ -177,18 +177,59 @@ class ImageCanvasSelectionMixin:
         for handle in self._selection_handles:
             self._scene.removeItem(handle)
         self._selection_handles.clear()
+        self._lasso_drag_snapshot = None
+
+    def _selection_handle_drag_started(self, index: int) -> None:
+        if not 0 <= index < len(self._free_selection_points):
+            self._lasso_drag_snapshot = None
+            return
+        points = list(self._free_selection_points)
+        visible_indices = [
+            visible_index
+            for visible_index, _point in self._visible_free_selection_handle_points(points)
+        ]
+        if index not in visible_indices:
+            visible_indices.append(index)
+            visible_indices.sort()
+        self._lasso_drag_snapshot = {
+            "index": index,
+            "points": points,
+            "visible_indices": visible_indices,
+            "closed": self._free_selection_closed,
+        }
 
     def _selection_handle_moved(self, index: int, point: QPointF) -> None:
         if not 0 <= index < len(self._free_selection_points):
             return
-        self._free_selection_points[index] = point
+        snapshot = getattr(self, "_lasso_drag_snapshot", None)
+        if isinstance(snapshot, dict) and snapshot.get("index") == index:
+            original = list(snapshot.get("points", []))
+            visible_indices = list(snapshot.get("visible_indices", []))
+            closed = bool(snapshot.get("closed", self._free_selection_closed))
+            if not 0 <= index < len(original):
+                return
+            old_point = original[index]
+        else:
+            original = list(self._free_selection_points)
+            visible_indices = [
+                visible_index
+                for visible_index, _point in self._visible_free_selection_handle_points(original)
+            ]
+            closed = self._free_selection_closed
+            old_point = original[index]
+        delta = QPointF(point.x() - old_point.x(), point.y() - old_point.y())
+        if abs(delta.x()) < 1e-6 and abs(delta.y()) < 1e-6:
+            return
+        self._move_lasso_handle_neighborhood(index, point, delta, original, visible_indices, closed)
         self._update_free_selection_preview(close=True)
 
     def _selection_handle_released(self) -> None:
         if len(self._free_selection_points) < 3:
             return
         if self._free_selection_closed:
+            self._set_free_selection_handles(self._free_selection_points)
             self._update_free_selection_preview(close=True)
+            self._lasso_drag_snapshot = None
             return
         rect = _points_bounding_rect(self._free_selection_points)
         if rect.width() < 1 or rect.height() < 1:
@@ -202,6 +243,77 @@ class ImageCanvasSelectionMixin:
             int(rect.height()),
             polygon,
         )
+        self._lasso_drag_snapshot = None
+
+    def _move_lasso_handle_neighborhood(
+        self,
+        index: int,
+        point: QPointF,
+        delta: QPointF,
+        original: list[QPointF],
+        visible_indices: list[int],
+        closed: bool,
+    ) -> None:
+        """Move the visible handle and bend adjacent hidden freehand samples with it."""
+        if index not in visible_indices:
+            visible_indices.append(index)
+            visible_indices.sort()
+        previous_index = _previous_visible_lasso_index(
+            visible_indices,
+            index,
+            len(original),
+            closed=closed,
+        )
+        next_index = _next_visible_lasso_index(
+            visible_indices,
+            index,
+            len(original),
+            closed=closed,
+        )
+        updated = list(original)
+        if previous_index is not None:
+            self._blend_lasso_handle_delta(
+                updated,
+                original,
+                previous_index,
+                index,
+                delta,
+                increasing=True,
+            )
+        if next_index is not None:
+            self._blend_lasso_handle_delta(
+                updated,
+                original,
+                index,
+                next_index,
+                delta,
+                increasing=False,
+            )
+        updated[index] = point
+        self._free_selection_points = updated
+
+    def _blend_lasso_handle_delta(
+        self,
+        updated: list[QPointF],
+        original: list[QPointF],
+        start_index: int,
+        end_index: int,
+        delta: QPointF,
+        *,
+        increasing: bool,
+    ) -> None:
+        sequence = _lasso_index_sequence(start_index, end_index, len(original))
+        if len(sequence) <= 2:
+            return
+        denominator = float(len(sequence) - 1)
+        for offset, point_index in enumerate(sequence[1:-1], start=1):
+            t = offset / denominator
+            weight = t if increasing else 1.0 - t
+            source = original[point_index]
+            updated[point_index] = QPointF(
+                source.x() + delta.x() * weight,
+                source.y() + delta.y() * weight,
+            )
 
     def _closed_free_selection_contains(self, point: QPointF) -> bool:
         if len(self._free_selection_points) < 3:
@@ -264,5 +376,43 @@ def _points_bounding_rect(points: list[QPointF]) -> QRectF:
     x0 = min(xs)
     y0 = min(ys)
     return QRectF(x0, y0, max(xs) - x0, max(ys) - y0)
+
+
+def _previous_visible_lasso_index(
+    visible_indices: list[int],
+    index: int,
+    point_count: int,
+    *,
+    closed: bool,
+) -> int | None:
+    before = [item for item in visible_indices if item < index]
+    if before:
+        return before[-1]
+    if closed and visible_indices and point_count > 1:
+        return visible_indices[-1]
+    return None
+
+
+def _next_visible_lasso_index(
+    visible_indices: list[int],
+    index: int,
+    point_count: int,
+    *,
+    closed: bool,
+) -> int | None:
+    after = [item for item in visible_indices if item > index]
+    if after:
+        return after[0]
+    if closed and visible_indices and point_count > 1:
+        return visible_indices[0]
+    return None
+
+
+def _lasso_index_sequence(start_index: int, end_index: int, point_count: int) -> list[int]:
+    if point_count <= 0:
+        return []
+    if start_index <= end_index:
+        return list(range(start_index, end_index + 1))
+    return list(range(start_index, point_count)) + list(range(0, end_index + 1))
 
 

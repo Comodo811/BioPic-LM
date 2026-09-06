@@ -85,15 +85,18 @@ class AnnotationAbbreviationsMixin:
         )
 
     def _rebuild_abbreviation_table_menu(self) -> None:
+        self.abbreviation_table_menu.setStyleSheet(_MEASURE_SCALE_STYLESHEET)
         self.abbreviation_table_menu.clear()
         if self._abbreviation_presets:
             for preset in self._abbreviation_presets.values():
                 preset_menu = self.abbreviation_table_menu.addMenu(preset.name)
+                preset_menu.setStyleSheet(_MEASURE_SCALE_STYLESHEET)
                 preset_menu.menuAction().setCheckable(True)
                 preset_menu.menuAction().setChecked(
                     preset.id == self._active_abbreviation_table_id
                 )
                 language_menu = preset_menu.addMenu("Language")
+                language_menu.setStyleSheet(_MEASURE_SCALE_STYLESHEET)
                 translated_languages = preset.translated_languages()
                 if not translated_languages:
                     action = QAction("No translated entries", language_menu)

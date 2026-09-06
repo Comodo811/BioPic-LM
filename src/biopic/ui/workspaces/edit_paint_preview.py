@@ -230,6 +230,11 @@ class EditPaintPreviewMixin:
         self._paint_stroke_alpha = alpha
         self._paint_stroke_operation = operation
         if self._paint_stroke_before is not None:
+            if operation == "clone" and dirty_rect is not None:
+                preview = self._live_staged_preview(layer, content, alpha, dirty_rect)
+                self._current_pixels = preview
+                self.canvas.update_tile_region(preview, dirty_rect)
+                return
             if preview_points is not None and preview_radius is not None:
                 self.canvas.extend_paint_preview(
                     preview_points,
